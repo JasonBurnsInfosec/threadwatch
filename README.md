@@ -18,8 +18,7 @@ and summarises it in terms you can act on, including per-frame costs when you gi
 
 In the investigation it was built for (Total War: ROME II under Proton), it showed the game pinning its
 main thread to two CPUs, MangoHud's sampler thread inheriting that pin, and the main thread losing time
-to wineserver round trips, which led to the cause of an ntsync vs fsync gap
-([write-up](https://github.com/ValveSoftware/Proton/issues/512#issuecomment-6919218059)).
+to wineserver round trips, which led to the cause of an ntsync vs fsync gap.
 
 ## Features
 
