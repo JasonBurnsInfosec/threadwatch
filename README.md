@@ -3,7 +3,8 @@
 **Per-thread CPU profiler for games on Linux (Proton / Wine and native): CPU time, context switches,
 CPU affinity, SMT/L3 placement and what each hot thread is blocked in, without root or ptrace.**
 For answering "why is this game CPU-bound?": is it one thread, what is that thread waiting on, are
-busy threads fighting over the same core, how much time goes to wineserver.
+busy threads fighting over the same core, how much time goes to wineserver. Record a run and
+summarise it, or watch it live with `threadwatch top`.
 
 Part of a small toolkit for investigating Linux gaming performance:
 [gamerun](https://github.com/JasonBurnsInfosec/gamerun) (run and record) ·
@@ -31,6 +32,8 @@ to wineserver round trips, which led to the cause of an ntsync vs fsync gap.
 - Summaries restricted to a benchmark window, with **per-frame** CPU time and context switches
 - Heuristic hints: hot threads sharing a core, threads inheriting a pinned thread's mask, spin loops,
   wineserver waits
+- **Live view** (`threadwatch top`): per-core bars grouped by L3 cache, a sortable thread table and an
+  inspector for the selected thread, in the terminal
 - Text, Markdown or JSON output; works for any process (emulators, encoders, servers), not only games
 - Python 3.8+, standard library only, a single file; works on your own processes without root
 
@@ -44,6 +47,9 @@ ln -s ~/src/threadwatch/threadwatch ~/.local/bin/threadwatch
 ## Quick start
 
 ```sh
+# watch a running game live (q quits, ? explains every column)
+threadwatch top --name 'Rome2\.exe' --also wineserver
+
 # start before or after the game; follows it until it exits
 threadwatch record --name 'Rome2\.exe' --also wineserver --syscalls 1000 -o rome2-run1
 threadwatch summary rome2-run1 --fps 53.8            # --fps adds per-frame columns
@@ -56,6 +62,29 @@ threadwatch record --name '^ffmpeg$' -d 60 -o ffmpeg-sample && threadwatch summa
 
 [gamerun](https://github.com/JasonBurnsInfosec/gamerun) runs threadwatch automatically for every
 launch and limits the summary to the benchmark window.
+
+## Live view
+
+```sh
+threadwatch top --name 'Rome2\.exe' --also wineserver --syscalls 1000
+```
+
+A terminal dashboard of the same data `record` collects, refreshed every second (`-i` to change):
+
+- **Header**: the target's threads and cores busy (1.00 = one full core) with a history sparkline, the
+  hottest thread and its allowed-CPU mask, and every logical CPU grouped by L3 cache with system-wide
+  busy%. CPUs the hottest thread may run on are highlighted, the one it is on now is underlined, and
+  `*` marks the firmware's preferred (CPPC) cores.
+- **Thread table**: CPU% now and 10 s peak, current CPU, cores used, migrations, voluntary and
+  involuntary context switches, allowed mask, and notes (`main`, `pinned:N`, `hot-mask` for threads
+  sharing the hottest thread's mask, `spin?`). Idle threads are hidden until you press `a`.
+- **Inspector** for the selected thread: 2-minute CPU sparkline, which cores it ran on, and with
+  `--syscalls` what it is blocked in over the last 5 s (futex, ntsync waits, wineserver pipe reads...).
+
+Keys: `↑↓`/`j k` select, `s` sort, `a` all/active threads, `p` pause, `+ -` interval, `?` explains every
+column, `q` quits. With `--name` it waits for the process and picks up the next one when it exits.
+It records nothing; use `record` when you need numbers you can quote. Standard library `curses`, no extra
+dependencies.
 
 ## Recording
 
@@ -162,6 +191,9 @@ Patterns to look for:
 ## Limitations
 
 - Sampling at 0.25 s (CPU) and up to ~1–2 kHz (syscalls): very short events are averaged out.
+- `top` refreshes every 1 s by default and keeps only the last 2 minutes of each thread; it saves
+  nothing. Its `--syscalls` sampling costs a little CPU of its own, like `record`'s.
+- `top` needs a terminal of at least 60x16; 100+ columns shows the full per-core bars.
 - Thread names come from the kernel's `comm` (Wine fills it from `SetThreadDescription`); unnamed
   threads show as `(unnamed)`.
 - `--also` matches system-wide: with several Wine prefixes running, it records every wineserver.

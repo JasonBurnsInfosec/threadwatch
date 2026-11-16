@@ -4,6 +4,8 @@
   threadwatch record  (--pid PID | --name REGEX | --root PID [--name REGEX]) [--also REGEX]...
                       [--syscalls HZ] [-o DIR] [-i SECS] [-d SECS]
   threadwatch summary DIR [--window FILE | --from S --to S] [--fps N] [--top N] [--markdown | --json]
+  threadwatch top     (--pid PID | --name REGEX | --root PID [--name REGEX]) [--also REGEX]...
+                      [--syscalls HZ] [-i SECS]
 
 record samples every thread of the target process from /proc: CPU%, state, last core,
 allowed cores and voluntary/involuntary context switches, plus per-core busy% and the
@@ -25,10 +27,13 @@ Target selection:
 summary reads DIR/../window.json (written by `benchsum --write-window` / gamerun) when present,
 so it covers the same benchmark window as the FPS numbers; --no-window disables that.
 --fps (or the window's avg_fps) adds per-frame CPU time and context switches.
+top is a live terminal view of the same data (per-core bars by L3 group, sortable thread
+table, selected-thread inspector); press ? in it for an explanation of every column.
+
 Stdlib only. No root needed for your own processes.
 """
 import argparse, csv, json, os, re, signal, sys, threading, time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 
 CLK_TCK = os.sysconf('SC_CLK_TCK')
 NCPU = os.cpu_count()
@@ -641,8 +646,670 @@ def cmd_summary(args):
     return 0
 
 
+# ---------------------------------------------------------------- top (live view)
+SPARK = '▁▂▃▄▅▆▇█'
+EIGHTHS = ' ▏▎▍▌▋▊▉█'
+SORTS = ('cpu', 'peak', 'vol', 'invol', 'tid', 'name')
+
+
+def parse_cpulist(s):
+    """'0-1,16-17' -> {0, 1, 16, 17}."""
+    out = set()
+    for part in (s or '').split(','):
+        a, _, b = part.strip().partition('-')
+        try:
+            out.update(range(int(a), int(b or a) + 1))
+        except ValueError:
+            pass
+    return out
+
+
+def spark(values, vmax):
+    if not vmax:
+        return ''
+    return ''.join(SPARK[min(7, max(0, int(v / vmax * 7.999)))] for v in values)
+
+
+def hbar(frac, width):
+    """Horizontal bar of `width` cells with 1/8 resolution."""
+    eighths = int(round(max(0.0, min(1.0, frac)) * width * 8))
+    full, rem = divmod(eighths, 8)
+    return ('█' * full + (EIGHTHS[rem] if rem else '')).ljust(width)
+
+
+class LiveSyscalls(threading.Thread):
+    """Like SyscallSampler, but keeps only the last `keep` seconds, for the live view."""
+
+    def __init__(self, hz, keep=5):
+        super().__init__(daemon=True)
+        self.period, self.keep = 1.0 / hz, keep
+        self.lock = threading.Lock()
+        self.targets = []  # (pid, tid)
+        self.buckets = deque()  # (sec, Counter{(tid, state): n})
+        self.cls = Classifier()
+        self.done = threading.Event()
+
+    def set_targets(self, targets):
+        with self.lock:
+            self.targets = list(targets)
+
+    def run(self):
+        while not self.done.is_set():
+            sec = int(time.monotonic())
+            with self.lock:
+                targets = self.targets
+                if not self.buckets or self.buckets[-1][0] != sec:
+                    self.buckets.append((sec, Counter()))
+                    while self.buckets[0][0] <= sec - self.keep:
+                        self.buckets.popleft()
+                    if sec % 10 == 0:
+                        self.cls.fd_cache.clear()  # fds get reused; don't keep stale types forever
+                cur = self.buckets[-1][1]
+            for pid, tid in targets:
+                line = read(f'/proc/{pid}/task/{tid}/syscall')
+                if line is not None:
+                    state = self.cls.classify(pid, line)
+                    with self.lock:
+                        cur[(tid, state)] += 1
+            time.sleep(self.period)
+
+    def profile(self, tid):
+        out = Counter()
+        with self.lock:
+            for _, b in self.buckets:
+                for (t, state), n in b.items():
+                    if t == tid:
+                        out[state] += n
+        return out
+
+
+class LiveModel:
+    """Samples the target (and --also processes) and keeps short per-thread histories."""
+    HIST = 120
+
+    def __init__(self, args):
+        self.args = args
+        self.interval = args.interval
+        topo = topology()
+        self.phys = {c: (v['package'], v['core_id']) for c, v in topo.items()}
+        groups = defaultdict(list)
+        for c, v in topo.items():
+            groups[v['l3_group'] or '?'].append(c)
+        self.l3 = sorted(groups.items(), key=lambda kv: min(kv[1]))
+        perf = {c: int(v['cppc_highest_perf']) for c, v in topo.items() if (v['cppc_highest_perf'] or '').isdigit()}
+        top = max(perf.values()) if perf else None
+        # Preferred cores: the highest CPPC rank, if the firmware ranks cores at all.
+        self.preferred = {c for c, p in perf.items() if p == top} if perf and len(set(perf.values())) > 1 else set()
+        self.reset(None)
+
+    def reset(self, pid):
+        self.pid, self.comm = pid, ''
+        self.procs = {}
+        self.prev_th, self.prev_c, self.prev_t = {}, cpu_times(), time.monotonic()
+        self.hist = defaultdict(lambda: deque(maxlen=self.HIST))  # (pid, tid) -> (pct, cpu, vcs, nvcs)
+        self.rows, self.core_busy = [], {}
+        self.total_hist = deque(maxlen=self.HIST)
+        self.also_cores = defaultdict(float)
+        self.started, self.last_also, self.exited = time.monotonic(), 0.0, False
+        if pid:
+            st = read(f'/proc/{pid}/stat')
+            self.comm = parse_stat(st)[0] if st else '?'
+            self.procs = {pid: 'target'}
+            self.prev_th = {pid: thread_sample(pid) or {}}
+
+    def window(self, secs=10):
+        return max(1, int(round(secs / self.interval)))
+
+    def sample(self):
+        now = time.monotonic()
+        if now - self.prev_t < 0.5 * self.interval:
+            return  # just (re)started: a tiny dt turns one clock tick into thousands of percent
+        if self.args.also and now - self.last_also >= 2.0:
+            self.last_also = now
+            for label, p in find_also(self.args.also, {self.pid}):
+                if p not in self.procs:
+                    self.procs[p] = label
+                    self.prev_th[p] = thread_sample(p) or {}
+        samples = {p: thread_sample(p) for p in self.procs}
+        if samples[self.pid] is None:
+            self.exited = True
+            return
+        c = cpu_times()
+        dt = max(1e-6, now - self.prev_t)
+        for cpu, (busy, total) in c.items():
+            pb, pt = self.prev_c.get(cpu, (busy, total))
+            if total > pt:
+                self.core_busy[cpu] = 100.0 * (busy - pb) / (total - pt)
+        w = self.window()
+        rows, seen = [], set()
+        target_total = 0.0
+        self.also_cores = defaultdict(float)
+        for p, th in samples.items():
+            if th is None:
+                continue
+            label = self.procs[p]
+            for tid, s in th.items():
+                q = self.prev_th.get(p, {}).get(tid)
+                if q is None:
+                    continue
+                key = (p, tid)
+                seen.add(key)
+                pct = 100.0 * (s['ticks'] - q['ticks']) / CLK_TCK / dt
+                vcs, nvcs = (s['vcs'] - q['vcs']) / dt, (s['nvcs'] - q['nvcs']) / dt
+                h = self.hist[key]
+                h.append((pct, s['cpu'], vcs, nvcs))
+                recent = list(h)[-w:]
+                busy = [(x[0], x[1]) for x in recent if x[0] > 1.0]
+                migr = sum(1 for a, b in zip(busy, busy[1:]) if a[1] != b[1])
+                span = len(recent) * self.interval
+                rows.append({'key': key, 'pid': p, 'tid': tid, 'comm': s['comm'] or '(unnamed)', 'proc': label,
+                             'state': s['state'], 'cpu': s['cpu'], 'pct': pct, 'vcs': vcs, 'nvcs': nvcs,
+                             'allowed': s['allowed'], 'nallowed': len(parse_cpulist(s['allowed'])),
+                             'avg': sum(x[0] for x in recent) / len(recent), 'peak': max(x[0] for x in recent),
+                             'cores': Counter(x[1] for x in busy), 'migr': migr / span if span else 0.0})
+                if label == 'target':
+                    target_total += pct
+                else:
+                    self.also_cores[label] += pct / 100.0
+        for key in list(self.hist):
+            if key not in seen and key[0] not in samples:
+                del self.hist[key]
+        self.total_hist.append(target_total / 100.0)
+        self.rows = rows
+        self.prev_t, self.prev_c = now, c
+        self.prev_th = {p: th for p, th in samples.items() if th is not None}
+
+    def hottest(self):
+        tgt = [r for r in self.rows if r['proc'] == 'target']
+        return max(tgt, key=lambda r: r['avg']) if tgt else None
+
+
+class TopUI:
+    def __init__(self, scr, args):
+        import curses
+        self.c, self.scr, self.args = curses, scr, args
+        self.model = LiveModel(args)
+        self.sort, self.show_all, self.paused, self.help = 'cpu', False, False, False
+        self.sel_key, self.offset = None, 0
+        self.finder, self.found, self.status = None, None, ''
+        self.sys = None
+        if args.syscalls:
+            self.sys = LiveSyscalls(args.syscalls)
+            self.sys.start()
+        self.init_colors()
+
+    # -------------------------------------------------- setup
+    def init_colors(self):
+        c = self.c
+        c.curs_set(0)
+        self.scr.keypad(True)
+        self.A = defaultdict(int)
+        if not c.has_colors():
+            self.A.update(sel=c.A_REVERSE, hdr=c.A_REVERSE, title=c.A_BOLD, key=c.A_BOLD)
+            return
+        c.start_color()
+        try:
+            c.use_default_colors()
+            bg = -1
+        except c.error:
+            bg = c.COLOR_BLACK
+        rich = c.COLORS >= 256
+        spec = {  # name: (256-colour fg, bg, 8-colour fg, bg, extra attr)
+            'border': (208, bg, c.COLOR_YELLOW, bg, 0),
+            'title': (231, bg, c.COLOR_WHITE, bg, c.A_BOLD),
+            'dim': (244, bg, c.COLOR_WHITE, bg, 0 if rich else c.A_DIM),
+            'green': (112, bg, c.COLOR_GREEN, bg, 0),
+            'yellow': (220, bg, c.COLOR_YELLOW, bg, 0),
+            'red': (203, bg, c.COLOR_RED, bg, 0),
+            'cyan': (75, bg, c.COLOR_CYAN, bg, 0),
+            'magenta': (170, bg, c.COLOR_MAGENTA, bg, 0),
+            'orange': (214, bg, c.COLOR_YELLOW, bg, c.A_BOLD),
+            'hdr': (231, 238, c.COLOR_BLACK, c.COLOR_WHITE, c.A_BOLD),
+            'sel': (231, 25, c.COLOR_WHITE, c.COLOR_BLUE, c.A_BOLD),
+            'zebra': (252, 235, c.COLOR_WHITE, bg, 0),
+            'mask': (16, 220, c.COLOR_BLACK, c.COLOR_YELLOW, c.A_BOLD),
+            'key': (208, bg, c.COLOR_YELLOW, bg, c.A_BOLD),
+        }
+        for i, (name, (f256, b256, f8, b8, extra)) in enumerate(spec.items(), 1):
+            if rich:
+                c.init_pair(i, f256, b256)
+            else:
+                c.init_pair(i, f8, b8 if b8 != 238 else bg)
+            self.A[name] = c.color_pair(i) | extra
+
+    # -------------------------------------------------- drawing helpers
+    def put(self, y, x, s, attr=0, width=None):
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return x
+        s = str(s)
+        room = min(w - x, width if width is not None else w - x)
+        s = s[:max(0, room)]
+        try:
+            self.scr.addstr(y, x, s, attr)
+        except self.c.error:
+            pass  # writing the bottom-right cell raises after the write succeeds
+        return x + len(s)
+
+    def box(self, y, x, h, w, title=''):
+        a = self.A['border']
+        self.put(y, x, '╭' + '─' * (w - 2) + '╮', a)
+        for i in range(1, h - 1):
+            self.put(y + i, x, '│', a)
+            self.put(y + i, x + w - 1, '│', a)
+        self.put(y + h - 1, x, '╰' + '─' * (w - 2) + '╯', a)
+        if title:
+            self.put(y, x + 2, f' {title} ', self.A['cyan'])
+
+    def load_attr(self, pct):
+        return self.A['red'] if pct >= 85 else self.A['yellow'] if pct >= 50 else self.A['green']
+
+    # -------------------------------------------------- target lifecycle
+    def start_finder(self):
+        args = self.args
+        if args.pid:
+            self.found = args.pid
+            return
+        def run():
+            self.found = find_target(args)
+            if self.found is None and not _stop:
+                self.found = -1
+        self.found = None
+        self.finder = threading.Thread(target=run, daemon=True)
+        self.finder.start()
+
+    def poll_target(self):
+        m = self.model
+        if m.pid and not m.exited:
+            return
+        if m.pid and m.exited:
+            if self.args.pid or self.found == -1:
+                return  # nothing to wait for: keep the last frame
+            self.status = f'{m.comm} ({m.pid}) exited; waiting for the next match'
+            m.reset(None)
+            self.start_finder()
+        if self.found and self.found > 0 and not m.pid:
+            if read(f'/proc/{self.found}/stat'):
+                m.reset(self.found)
+                self.status = ''
+            else:
+                self.status = f'pid {self.found} not found'
+                self.found = -1
+
+    # -------------------------------------------------- views
+    def visible_rows(self):
+        m = self.model
+        rows = m.rows
+        if not self.show_all:
+            rows = [r for r in rows if r['peak'] >= 0.5 or r['tid'] == m.pid or r['key'] == self.sel_key]
+        key = {'cpu': lambda r: (-r['pct'], -r['avg']), 'peak': lambda r: -r['peak'], 'vol': lambda r: -r['vcs'],
+               'invol': lambda r: -r['nvcs'], 'tid': lambda r: (r['proc'] != 'target', r['tid']),
+               'name': lambda r: (r['comm'].lower(), r['tid'])}[self.sort]
+        return sorted(rows, key=key)
+
+    def notes(self, r, hot):
+        m, out = self.model, []
+        if r['tid'] == m.pid:
+            out.append('main')
+        if r['nallowed'] and r['nallowed'] < NCPU:
+            out.append(f"pinned:{r['nallowed']}")
+        if hot and r is not hot and r['proc'] == 'target' and hot['nallowed'] < NCPU and r['allowed'] == hot['allowed']:
+            out.append('hot-mask')
+        if r['avg'] > 80 and r['vcs'] > 1000:
+            out.append('spin?')
+        return ' '.join(out)
+
+    def draw_header(self, y, w):
+        m, A = self.model, self.A
+        hot = m.hottest()
+        hot_mask = parse_cpulist(hot['allowed']) if hot and hot['nallowed'] < NCPU else set()
+        cell = 10 if w >= 20 + 8 * 10 else 4  # "NN ▕bar▏" or "NN▆"
+        lines = 3 + len(m.l3)
+        self.box(y, 0, lines + 2, w, 'threadwatch')
+        x = 2
+        r1 = y + 1
+        if not m.pid:
+            self.put(r1, x, self.status or f"waiting for a process matching {self.args.name or 'the busiest descendant'}...",
+                     A['yellow'])
+            return y + lines + 2
+        busy = m.total_hist[-1] if m.total_hist else 0.0
+        x = self.put(r1, x, m.comm, A['title'])
+        x = self.put(r1, x, f'  pid {m.pid}', A['dim'])
+        nthreads = sum(1 for r in m.rows if r['proc'] == 'target')
+        x = self.put(r1, x, f'  {nthreads} threads  ')
+        x = self.put(r1, x, f'{busy:.2f}', A['title'])
+        x = self.put(r1, x, f' of {NCPU} cores busy  ')
+        hist = list(m.total_hist)[-max(10, min(60, w - x - 30)):]
+        x = self.put(r1, x, spark(hist, max(hist + [1.0])), A['green'])
+        x = self.put(r1, x, f'  peak {max(hist + [0.0]):.2f}', A['dim'])
+        for label, cores in sorted(m.also_cores.items()):
+            x = self.put(r1, x, f'  {label} ', A['dim'])
+            x = self.put(r1, x, f'{cores:.2f}', A['magenta'])
+        el = int(time.monotonic() - m.started)
+        tail = ('PAUSED  ' if self.paused else '') + f'{self.model.interval:g}s  {el // 60}:{el % 60:02d}'
+        self.put(r1, w - 2 - len(tail), tail, A['orange'] if self.paused else A['dim'])
+        r2 = y + 2
+        if hot:
+            x = self.put(r2, 2, 'hottest ', A['dim'])
+            x = self.put(r2, x, f"{hot['comm']} ({hot['tid']})", A['title'])
+            x = self.put(r2, x, f"  {hot['avg']:.0f}% avg 10s  on CPU {hot['cpu']}  allowed ")
+            x = self.put(r2, x, hot['allowed'], A['mask'] if hot_mask else A['dim'])
+            if hot_mask:
+                sharers = sum(1 for r in m.rows if r is not hot and r['proc'] == 'target' and r['allowed'] == hot['allowed'])
+                self.put(r2, x, f'  {sharers} other thread(s) share this mask', A['yellow'] if sharers else A['dim'])
+        for i, (group, cpus) in enumerate(m.l3):
+            ry = y + 3 + i
+            x = self.put(ry, 2, f'L3 {group}'[:16].ljust(17), A['cyan'])
+            for cpu in sorted(cpus):
+                pct = m.core_busy.get(cpu, 0.0)
+                num_attr = A['mask'] if cpu in hot_mask else A['dim']
+                if hot and cpu == hot['cpu']:
+                    num_attr |= self.c.A_UNDERLINE | self.c.A_BOLD
+                x = self.put(ry, x, f'{cpu:>2}', num_attr)
+                x = self.put(ry, x, '*' if cpu in m.preferred else ' ', A['orange'])
+                if cell == 10:
+                    x = self.put(ry, x, hbar(pct / 100, 5), self.load_attr(pct))
+                    x = self.put(ry, x, '  ')
+                else:
+                    x = self.put(ry, x, SPARK[min(7, int(pct / 100 * 7.999))], self.load_attr(pct))
+        ry = y + 3 + len(m.l3)
+        x = self.put(ry, 2, 'bars: system-wide busy per logical CPU   ', A['dim'])
+        if hot_mask:
+            x = self.put(ry, x, ' N ', A['mask'])
+            x = self.put(ry, x, " hottest thread's allowed CPUs   ", A['dim'])
+        x = self.put(ry, x, 'underlined: it runs there now', A['dim'])
+        if m.preferred:
+            self.put(ry, x, '   * preferred (CPPC) cores', A['dim'])
+        return y + lines + 2
+
+    COLS = [('TID', 7, '>'), ('Thread', 18, '<'), ('Proc', 10, '<'), ('S', 1, '<'), ('CPU%', 6, '>'), ('', 10, '<'),
+            ('Peak', 5, '>'), ('CPU', 3, '>'), ('Cores', 5, '>'), ('Migr/s', 6, '>'), ('Vol/s', 7, '>'),
+            ('Invol/s', 7, '>'), ('Allowed', 12, '<'), ('Notes', 0, '<')]
+
+    def draw_table(self, y, h, w, rows):
+        m, A = self.model, self.A
+        cols = [c for c in self.COLS if c[0] != 'Proc' or self.args.also]
+        hot = m.hottest()
+        x = 0
+        self.put(y, 0, ' ' * w, A['hdr'])
+        for name, width, align in cols:
+            label = name + ('▼' if (name, self.sort) in (('CPU%', 'cpu'), ('Peak', 'peak'), ('Vol/s', 'vol'),
+                                                          ('Invol/s', 'invol'), ('TID', 'tid'), ('Thread', 'name')) else '')
+            width = width or max(0, w - x - 1)
+            x = self.put(y, x + 1, label.rjust(width) if align == '>' else label.ljust(width), A['hdr'])
+        body = h - 1
+        if not rows:
+            self.put(y + 1, 2, 'no thread samples yet' if m.pid else '', A['dim'])
+            return
+        keys = [r['key'] for r in rows]
+        if self.sel_key not in keys:
+            self.sel_key = keys[0]
+        si = keys.index(self.sel_key)
+        self.offset = min(max(self.offset, si - body + 1), si, max(0, len(rows) - body))
+        self.offset = max(0, self.offset)
+        for i, r in enumerate(rows[self.offset:self.offset + body]):
+            ry = y + 1 + i
+            selected = r['key'] == self.sel_key
+            base = A['sel'] if selected else (A['zebra'] if i % 2 else 0)
+            self.put(ry, 0, ' ' * w, base)
+            x = 0
+            for name, width, align in cols:
+                width = width or max(0, w - x - 1)
+                attr = base
+                if name == 'TID':
+                    v = r['tid']
+                elif name == 'Thread':
+                    v = r['comm']
+                    attr = base | (self.c.A_BOLD if r['tid'] == m.pid else 0)
+                elif name == 'Proc':
+                    v = r['proc']
+                    attr = base if selected or r['proc'] == 'target' else A['magenta']
+                elif name == 'S':
+                    v = r['state']
+                    attr = base if selected or v != 'R' else A['green']
+                elif name == 'CPU%':
+                    v = f"{r['pct']:.1f}"
+                    attr = base if selected else self.load_attr(r['pct']) | self.c.A_BOLD
+                elif name == '':
+                    v = hbar(r['pct'] / 100, width)
+                    attr = base if selected else self.load_attr(r['pct'])
+                elif name == 'Peak':
+                    v = f"{r['peak']:.0f}"
+                elif name == 'CPU':
+                    v = r['cpu']
+                elif name == 'Cores':
+                    v = len(r['cores'])
+                elif name == 'Migr/s':
+                    v = f"{r['migr']:.1f}"
+                elif name == 'Vol/s':
+                    v = f"{r['vcs']:.0f}"
+                elif name == 'Invol/s':
+                    v = f"{r['nvcs']:.0f}"
+                    attr = base if selected or r['nvcs'] < 100 else A['yellow']
+                elif name == 'Allowed':
+                    v = r['allowed']
+                    attr = base if selected or r['nallowed'] >= NCPU else A['yellow']
+                else:
+                    v = self.notes(r, hot)
+                    attr = base if selected else A['orange']
+                v = str(v)[:width]
+                x = self.put(ry, x + 1, v.rjust(width) if align == '>' else v.ljust(width), attr)
+        if len(rows) > body:
+            self.put(y, w - 12, f' {self.offset + 1}-{min(len(rows), self.offset + body)}/{len(rows)} ', A['hdr'])
+
+    def draw_inspector(self, y, h, w, r):
+        m, A = self.model, self.A
+        title = f"{r['comm']} ({r['tid']})" + ('' if r['proc'] == 'target' else f" - {r['proc']}") if r else 'no thread selected'
+        self.box(y, 0, h, w, title)
+        if not r:
+            return
+        x0, ry = 2, y + 1
+        x = self.put(ry, x0, 'CPU ', A['dim'])
+        x = self.put(ry, x, f"{r['pct']:.1f}%", self.load_attr(r['pct']) | self.c.A_BOLD)
+        x = self.put(ry, x, f"   avg 10s {r['avg']:.1f}%   peak {r['peak']:.0f}%   state {r['state']}   on CPU {r['cpu']}   ")
+        x = self.put(ry, x, f"vol {r['vcs']:.0f}/s  invol {r['nvcs']:.0f}/s   allowed ", A['dim'])
+        self.put(ry, x, f"{r['allowed']} ({r['nallowed']} CPUs)", A['yellow'] if r['nallowed'] < NCPU else 0)
+        ry += 1
+        hist = [p[0] for p in m.hist.get(r['key'], ())][-(w - 20):]
+        x = self.put(ry, x0, f"last {len(hist) * m.interval:.0f}s".ljust(11), A['dim'])
+        x = self.put(ry, x, spark(hist, 100.0), self.load_attr(r['avg']))
+        self.put(ry, x, '  (0-100%)', A['dim'])
+        ry += 1
+        x = self.put(ry, x0, 'cores 10s'.ljust(11), A['dim'])
+        tot = sum(r['cores'].values())
+        if tot:
+            parts = r['cores'].most_common(6)
+            for cpu, n in parts:
+                x = self.put(ry, x, f'{cpu}', A['cyan'])
+                x = self.put(ry, x, f' {100 * n / tot:.0f}%  ')
+            physs = {m.phys.get(c) for c in r['cores']}
+            groups = {g for g, cpus in m.l3 if set(r['cores']) & set(cpus)}
+            self.put(ry, x, f"  {len(physs)} physical core(s), {len(groups)} L3 group(s), {r['migr']:.1f} migrations/s", A['dim'])
+        else:
+            self.put(ry, x, 'idle (no samples above 1% CPU)', A['dim'])
+        ry += 1
+        x = self.put(ry, x0, 'blocked in'.ljust(11), A['dim'])
+        if not self.sys:
+            self.put(ry, x, 'start with --syscalls 1000 to see what this thread waits on (futex, ntsync, wineserver...)', A['dim'])
+        else:
+            prof = self.sys.profile(r['tid'])
+            tot = sum(prof.values())
+            if tot < 20:
+                self.put(ry, x, 'sampling...', A['dim'])
+            else:
+                for state, n in prof.most_common(5):
+                    x = self.put(ry, x, f'{100 * n / tot:.0f}% ', A['title'])
+                    x = self.put(ry, x, f'{state}   ', A['green'] if state == 'running' else A['cyan'])
+                self.put(ry, x, f'(last {self.sys.keep}s, {tot} samples)', A['dim'])
+        ry += 1
+        hints = []
+        hot = m.hottest()
+        if r is hot and r['avg'] > 90 and (m.total_hist[-1] if m.total_hist else 0) < 3:
+            hints.append('near 100% while few cores are busy: likely the bottleneck')
+        if hot and r is not hot and r['proc'] == 'target' and hot['nallowed'] < NCPU and r['allowed'] == hot['allowed']:
+            hints.append(f"shares the hottest thread's mask {hot['allowed']}: it competes with that thread "
+                         '(threads inherit the mask of the thread that created them)')
+        if r['avg'] > 80 and r['vcs'] > 1000:
+            hints.append('busy with >1000 voluntary switches/s: possible spin or yield loop')
+        if r['nvcs'] > 200:
+            hints.append('many involuntary switches: preempted, the CPUs it may use are contended')
+        if hints and ry < y + h - 1:
+            self.put(ry, x0, 'hints', A['dim'])
+            self.put(ry, x0 + 11, '; '.join(hints), A['orange'])
+
+    def draw_footer(self, y, w):
+        A = self.A
+        self.put(y, 0, ' ' * w, A['hdr'])
+        x = 1
+        for k, label in (('q', 'Quit'), ('s', f'Sort:{self.sort}'), ('a', 'All' if self.show_all else 'Active'),
+                         ('p', 'Resume' if self.paused else 'Pause'), ('↑↓', 'Select'), ('+/-', 'Interval'),
+                         ('?', 'Explain')):
+            x = self.put(y, x, k, A['key'])
+            x = self.put(y, x, f' {label}  ', A['hdr'])
+        hidden = len(self.model.rows) - len(self.visible_rows())
+        if hidden > 0:
+            msg = f'{hidden} idle threads hidden '
+            self.put(y, w - len(msg) - 1, msg, A['hdr'])
+
+    HELP = [
+        ('Header', 'target process, threads, cores busy (sum of its threads, 1.00 = one full core), history sparkline.'),
+        ('hottest', 'the target thread with the highest 10 s average CPU, its current CPU and allowed-CPU mask.'),
+        ('L3 rows', 'every logical CPU grouped by shared L3 cache (CCX/CCD), with system-wide busy%.'),
+        ('', "highlighted numbers: CPUs the hottest thread may run on; underlined: where it runs now."),
+        ('CPU%', 'this thread over the last sample interval (100 = one core).'),
+        ('Peak', 'highest CPU% in the last 10 s.   Cores: distinct CPUs used above 1% in the last 10 s.'),
+        ('Migr/s', 'how often the thread moved CPUs while busy (last 10 s).'),
+        ('Vol/s', 'voluntary context switches: the thread blocked (waits, sleeps, wineserver round trips).'),
+        ('Invol/s', 'involuntary switches: preempted by the scheduler; high = contended CPUs.'),
+        ('Allowed', 'Cpus_allowed_list; yellow when restricted (pinned).'),
+        ('Notes', 'main = main thread, pinned:N = allowed on N CPUs, hot-mask = same mask as the hottest'),
+        ('', 'thread (competes with it), spin? = busy with many voluntary switches.'),
+        ('blocked in', 'with --syscalls HZ: what the selected thread is doing when sampled (last 5 s).'),
+        ('Keys', 'q quit  s sort  a all/active threads  p pause  ↑↓ PgUp PgDn Home End select  +/- interval'),
+        ('', 'Hints are heuristics. Record with `threadwatch record` for numbers you can quote.'),
+    ]
+
+    def draw_help(self, h, w):
+        bw, bh = min(w - 4, 112), min(h - 2, len(self.HELP) + 4)
+        y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+        for i in range(bh):
+            self.put(y0 + i, x0, ' ' * bw)
+        self.box(y0, x0, bh, bw, 'Explain  (any key closes)')
+        for i, (k, text) in enumerate(self.HELP[:bh - 4]):
+            self.put(y0 + 2 + i, x0 + 2, k.ljust(11), self.A['orange'])
+            self.put(y0 + 2 + i, x0 + 13, text, 0, bw - 15)
+
+    def draw(self):
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        if h < 16 or w < 60:
+            self.put(0, 0, f'threadwatch top needs at least 60x16 (now {w}x{h})', self.A['yellow'])
+            scr.refresh()
+            return
+        y = self.draw_header(0, w)
+        rows = self.visible_rows()
+        insp_h = 7
+        table_h = h - y - insp_h - 1
+        self.draw_table(y, table_h, w, rows)
+        sel = next((r for r in rows if r['key'] == self.sel_key), None)
+        self.draw_inspector(y + table_h, insp_h, w, sel)
+        self.draw_footer(h - 1, w)
+        if self.help:
+            self.draw_help(h, w)
+        scr.refresh()
+
+    # -------------------------------------------------- input and main loop
+    def move(self, delta):
+        rows = self.visible_rows()
+        if not rows:
+            return
+        keys = [r['key'] for r in rows]
+        i = keys.index(self.sel_key) if self.sel_key in keys else 0
+        self.sel_key = keys[max(0, min(len(keys) - 1, i + delta))]
+
+    def key(self, ch):
+        c = self.c
+        if self.help:
+            self.help = False
+            return True
+        if ch in (ord('q'), ord('Q'), 27):
+            return False
+        page = max(1, self.scr.getmaxyx()[0] - 20)
+        moves = {c.KEY_UP: -1, ord('k'): -1, c.KEY_DOWN: 1, ord('j'): 1, c.KEY_PPAGE: -page, c.KEY_NPAGE: page,
+                 c.KEY_HOME: -10 ** 6, c.KEY_END: 10 ** 6}
+        if ch in moves:
+            self.move(moves[ch])
+        elif ch == ord('s'):
+            self.sort = SORTS[(SORTS.index(self.sort) + 1) % len(SORTS)]
+        elif ch == ord('a'):
+            self.show_all = not self.show_all
+        elif ch in (ord('p'), ord(' ')):
+            self.paused = not self.paused
+        elif ch in (ord('+'), ord('=')):
+            self.model.interval = min(10.0, self.model.interval * 2)
+        elif ch in (ord('-'), ord('_')):
+            self.model.interval = max(0.25, self.model.interval / 2)
+        elif ch == ord('?'):
+            self.help = True
+        return True
+
+    def update_syscall_targets(self):
+        if not self.sys or not self.model.pid:
+            return
+        m = self.model
+        tg = {(m.pid, m.pid)}
+        if self.sel_key:
+            tg.add(self.sel_key)
+        hot = sorted((r for r in m.rows if r['proc'] == 'target'), key=lambda r: -r['avg'])[:2]
+        tg.update(r['key'] for r in hot)
+        self.sys.set_targets(sorted(tg))
+
+    def run(self):
+        self.start_finder()
+        self.scr.timeout(100)
+        next_sample = 0.0
+        while not _stop:
+            self.poll_target()
+            now = time.monotonic()
+            if self.model.pid and not self.model.exited and not self.paused and now >= next_sample:
+                self.model.sample()
+                next_sample = now + self.model.interval
+                self.update_syscall_targets()
+            self.draw()
+            ch = self.scr.getch()
+            while ch != -1:
+                if ch == self.c.KEY_RESIZE:
+                    pass
+                elif not self.key(ch):
+                    return 0
+                self.update_syscall_targets()
+                ch = self.scr.getch() if not self.help else -1
+                if ch != -1 or self.help:
+                    self.draw()
+        return 0
+
+
+def cmd_top(args):
+    import curses
+    signal.signal(signal.SIGTERM, _on_signal)
+    if not sys.stdout.isatty():
+        print('threadwatch top needs a terminal', file=sys.stderr)
+        return 1
+    os.environ.setdefault('ESCDELAY', '25')  # Esc quits; curses otherwise waits 1 s to rule out an escape sequence
+    try:
+        return curses.wrapper(lambda scr: TopUI(scr, args).run())
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        global _stop
+        _stop = True  # ends a finder thread still waiting for a target
+
+
 def main():
-    ap = argparse.ArgumentParser(prog='threadwatch', description=__doc__.split('\n')[0])
+    ap = argparse.ArgumentParser(prog='threadwatch', description=__doc__.split('\n')[0],
+                                 epilog='Run `threadwatch <command> -h` for options. '
+                                        'Docs: https://github.com/JasonBurnsInfosec/threadwatch')
     sub = ap.add_subparsers(dest='cmd', required=True)
     r = sub.add_parser('record', help='sample a process')
     g = r.add_mutually_exclusive_group()
@@ -665,9 +1332,35 @@ def main():
     s.add_argument('--top', type=int, default=15, help='threads to list (default 15)')
     s.add_argument('--markdown', action='store_true', help='Markdown tables (for GitHub)')
     s.add_argument('--json', action='store_true', help='machine-readable summary')
+    t = sub.add_parser(
+        'top', help='live per-thread view in the terminal', formatter_class=argparse.RawDescriptionHelpFormatter,
+        description='Live terminal view: per-core load grouped by L3 cache, a sortable thread table and an '
+                    'inspector for the selected thread. Records nothing; use `record` for numbers you can quote.',
+        epilog="""keys:
+  up/down, j/k, PgUp/PgDn, Home/End   select a thread
+  s     cycle sort: cpu, peak, vol, invol, tid, name
+  a     show all threads / only active ones
+  p     pause / resume (space works too)
+  + -   double / halve the refresh interval
+  ?     explain every column
+  q     quit (Esc works too)
+
+examples:
+  threadwatch top --name 'Rome2\\.exe' --also wineserver --syscalls 1000
+  threadwatch top --pid 12345 -i 0.5""")
+    t.add_argument('--pid', type=int, help='watch this process')
+    t.add_argument('--name', help='regex on process name / argv0 basename (waits for it, follows restarts)')
+    t.add_argument('--root', type=int, help='restrict search to descendants of this pid')
+    t.add_argument('--also', action='append', metavar='REGEX', help='also show processes matching REGEX (repeatable)')
+    t.add_argument('--syscalls', type=float, metavar='HZ', default=0,
+                   help='sample what the selected, main and 2 busiest threads are blocked in (e.g. 1000)')
+    t.add_argument('-i', '--interval', type=float, default=1.0, help='seconds between refreshes (default 1)')
+    t.add_argument('--wait', type=float, default=0, help=argparse.SUPPRESS)
     a = ap.parse_args()
-    if a.cmd == 'record' and not (a.pid or a.name or a.root):
-        ap.error('record needs --pid, --name or --root')
+    if a.cmd in ('record', 'top') and not (a.pid or a.name or a.root):
+        ap.error(f'{a.cmd} needs --pid, --name or --root')
+    if a.cmd == 'top':
+        return cmd_top(a)
     return cmd_record(a) if a.cmd == 'record' else cmd_summary(a)
 
 
