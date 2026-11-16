@@ -40,7 +40,7 @@ to wineserver round trips, which led to the cause of an ntsync vs fsync gap.
 - Heuristic hints: hot threads sharing a core, threads inheriting a pinned thread's mask, spin loops,
   wineserver waits
 - **Live view** (`threadwatch top`): per-core bars grouped by L3 cache, a sortable thread table and an
-  inspector for the selected thread, in the terminal
+  inspector for the selected thread, in the terminal; press `r` to record what you are watching
 - Text, Markdown or JSON output; works for any process (emulators, encoders, servers), not only games
 - Python 3.8+, standard library only, a single file; works on your own processes without root
 
@@ -92,11 +92,33 @@ A terminal dashboard of the same data `record` collects (screenshot at the top),
 - **Inspector** for the selected thread: 2-minute CPU sparkline, which cores it ran on, and with
   `--syscalls` what it is blocked in over the last 5 s (futex, ntsync waits, wineserver pipe reads...).
 
-Keys: `↑↓`/`j k` select, `s` sort, `a` all/active threads, `p` pause, `+ -` interval, `?` explains every
-column, `q` quits. It waits for the game (or the `--name` match) and picks up the next one when it exits.
+Keys: `↑↓`/`j k` select, `s` sort, `a` all/active threads, `p` pause, `r` record, `+ -` interval,
+`?` explains every column, `q` quits. It waits for the game (or the `--name` match) and picks up the next one when it exits.
 If the game starts from a launcher, it moves to the game once that is clearly busier.
-It records nothing; use `record` when you need numbers you can quote. Standard library `curses`, no extra
-dependencies.
+Standard library `curses`, no extra dependencies.
+
+### Recording from the live view
+
+Press `r` to start recording what you are watching and `r` again to stop. A red `● REC` timer shows
+in the header. Each recording is a normal `threadwatch record` directory (`threads.csv`, `cores.csv`,
+`meta.json`, and `syscalls.csv` with `--syscalls`), sampled every 0.25 s whatever the screen's refresh
+rate, so `threadwatch summary` and everything built on it work unchanged:
+
+```sh
+threadwatch top                                  # r ... r while something interesting happens
+threadwatch summary threadwatch-Rome2.exe-20261116-160106
+threadwatch top --record --rec-dir ~/runs        # record every game it follows, start to finish
+```
+
+| option | |
+|---|---|
+| `--record` | start recording as soon as a target is found (and again for each new target) |
+| `--rec-dir DIR` | where recordings go (default: the current directory), named `threadwatch-<process>-<time>` |
+| `--rec-interval SECS` | sampling interval of recordings (default 0.25, like `record`) |
+
+A recording is never lost: it is saved when you stop it, quit (`q`, Esc, Ctrl+C or SIGTERM), when the
+game exits, or when the view moves from a launcher to the game. When `top` exits it prints each saved
+directory with the `summary` command to run.
 
 ## Choosing the process
 
@@ -140,7 +162,7 @@ Output files:
 | `threads.csv` | t, tid, thread name, state, last CPU, CPU%, voluntary and involuntary switches per second, allowed-CPU list, process (`target` or the `--also` name), pid |
 | `cores.csv` | busy% per logical CPU (system-wide) |
 | `syscalls.csv` | with `--syscalls`: per second and thread, how many samples were running or in each syscall |
-| `meta.json` | target, Steam app ID and game name, settings, extra processes seen, CPU topology |
+| `meta.json` | target, Steam app ID and game name, settings, extra processes seen, CPU topology, `source` (`record` or `top`) |
 
 ### How syscall sampling works
 
@@ -219,8 +241,15 @@ Patterns to look for:
 ## Limitations
 
 - Sampling at 0.25 s (CPU) and up to ~1–2 kHz (syscalls): very short events are averaged out.
-- `top` refreshes every 1 s by default and keeps only the last 2 minutes of each thread; it saves
-  nothing. Its `--syscalls` sampling costs a little CPU of its own, like `record`'s.
+- CPU time comes from the kernel in 10 ms ticks, so a single 0.25 s sample is accurate to about ±4%; a
+  busy thread can read 104% for one sample. Values are stored as measured; averages over many samples
+  are not affected.
+- Recordings are plain CSV, about 10–15 KB per second for a game with ~60 threads (roughly 50 MB per
+  hour with `top --record`). `meta.json` stores the target's command line; check it before sharing a
+  recording of a native game whose path includes your home directory.
+- `top` refreshes every 1 s by default and keeps only the last 2 minutes of each thread on screen;
+  press `r` to save data. Its `--syscalls` sampling costs a little CPU of its own, like `record`'s, and
+  a recording with `--syscalls` runs a second sampler while it lasts.
 - `top` needs a terminal of at least 60x16; 100+ columns shows the full per-core bars.
 - Thread names come from the kernel's `comm` (Wine fills it from `SetThreadDescription`); unnamed
   threads show as `(unnamed)`.

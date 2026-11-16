@@ -6,6 +6,7 @@
   threadwatch summary DIR [--window FILE | --from S --to S] [--fps N] [--top N] [--markdown | --json]
   threadwatch top     [--appid N | --pid PID | --name REGEX | --root PID [--name REGEX]]
                       [--also REGEX]... [--syscalls HZ] [-i SECS]
+                      [--record] [--rec-dir DIR] [--rec-interval SECS]
 
 record samples every thread of the target process from /proc: CPU%, state, last core,
 allowed cores and voluntary/involuntary context switches, plus per-core busy% and the
@@ -34,11 +35,12 @@ summary reads DIR/../window.json (written by `benchsum --write-window` / gamerun
 so it covers the same benchmark window as the FPS numbers; --no-window disables that.
 --fps (or the window's avg_fps) adds per-frame CPU time and context switches.
 top is a live terminal view of the same data (per-core bars by L3 group, sortable thread
-table, selected-thread inspector); press ? in it for an explanation of every column.
+table, selected-thread inspector); press ? in it for an explanation of every column and r
+to record what you are watching (the same files as record, so summary works on them).
 
 Stdlib only. No root needed for your own processes.
 """
-import argparse, csv, json, os, re, signal, sys, threading, time
+import argparse, csv, json, os, re, shlex, signal, sys, threading, time
 from collections import Counter, defaultdict, deque
 
 CLK_TCK = os.sysconf('SC_CLK_TCK')
@@ -483,6 +485,111 @@ class SyscallSampler(threading.Thread):
 
 
 # ---------------------------------------------------------------- record
+class Recorder:
+    """Writes one recording (threads.csv, cores.csv, meta.json, and syscalls.csv with syscall sampling)
+    for a target process. Used by `record` and by `top`'s record key; call step() once per interval
+    and close() exactly once at the end."""
+
+    def __init__(self, pid, out, interval, args, syscall_hz=0, source='record'):
+        stat = read(f'/proc/{pid}/stat')
+        if not stat:
+            raise ProcessLookupError(pid)
+        os.makedirs(out, exist_ok=True)
+        self.pid, self.out, self.interval, self.args = pid, out, interval, args
+        self.comm = parse_stat(stat)[0]
+        appid = steam_appid(pid)
+        self.meta = {
+            'tool': 'threadwatch', 'version': 2, 'pid': pid, 'comm': self.comm,
+            'cmdline': (read(f'/proc/{pid}/cmdline') or '').replace('\0', ' ').strip(),
+            'interval_s': interval, 'clk_tck': CLK_TCK, 'ncpu': NCPU,
+            'start_epoch': time.time(), 'topology': topology(), 'also': args.also or [],
+            'syscall_hz': syscall_hz or 0, 'also_seen': {},
+            'steam_appid': appid, 'game': steam_game_name(appid), 'source': source,
+        }
+        self.tf = open(os.path.join(out, 'threads.csv'), 'w', newline='')
+        self.cf = open(os.path.join(out, 'cores.csv'), 'w', newline='')
+        self.tw, self.cw = csv.writer(self.tf), csv.writer(self.cf)
+        self.tw.writerow(['t', 'tid', 'comm', 'state', 'cpu', 'cpu_pct', 'vcs_per_s', 'nvcs_per_s', 'allowed', 'proc', 'pid'])
+        self.cw.writerow(['t', 'cpu', 'busy_pct'])
+        self.t0 = time.monotonic()
+        self.sampler = None
+        if syscall_hz:
+            self.sampler = SyscallSampler(syscall_hz, self.t0)
+            self.sampler.set_targets([('target', pid, pid, 'main')])
+            self.sampler.start()
+        self.procs = {pid: 'target'}  # pid -> label
+        for label, p in companions(args, pid):
+            self.procs[p] = label
+            self.meta['also_seen'][str(p)] = label
+        self.prev_t = self.t0
+        self.prev_th = {p: thread_sample(p) or {} for p in self.procs}
+        self.prev_c = cpu_times()
+        self.nsamples, self.last_also, self.closed = 0, self.t0, False
+
+    def elapsed(self):
+        return time.monotonic() - self.t0
+
+    def step(self):
+        """Take one sample. Returns False when the target has exited (nothing written for it)."""
+        now = time.monotonic()
+        pid = self.pid
+        if now - self.last_also >= 2.0:
+            self.last_also = now
+            for label, p in companions(self.args, pid):
+                if p not in self.procs:
+                    self.procs[p] = label
+                    self.meta['also_seen'][str(p)] = label
+                    self.prev_th[p] = thread_sample(p) or {}
+        samples = {p: thread_sample(p) for p in self.procs}
+        if samples[pid] is None:
+            return False  # target exited
+        c = cpu_times()
+        dt = now - self.prev_t
+        t = round(now - self.t0, 3)
+        hot = []
+        for p, th in samples.items():
+            if th is None:
+                continue
+            label = self.procs[p]
+            for tid, s in th.items():
+                q = self.prev_th.get(p, {}).get(tid)
+                if q is None:
+                    continue  # new thread: needs two samples for deltas
+                pct = round(100.0 * (s['ticks'] - q['ticks']) / CLK_TCK / dt, 1)
+                self.tw.writerow([t, tid, s['comm'], s['state'], s['cpu'], pct,
+                                  round((s['vcs'] - q['vcs']) / dt, 1), round((s['nvcs'] - q['nvcs']) / dt, 1),
+                                  s['allowed'], label, p])
+                if p == pid and tid != pid:
+                    hot.append((pct, tid))
+        for cpu, (busy, total) in c.items():
+            pb, pt = self.prev_c.get(cpu, (busy, total))
+            if total > pt:
+                self.cw.writerow([t, cpu, round(100.0 * (busy - pb) / (total - pt), 1)])
+        if self.sampler and self.nsamples % 8 == 0:  # refresh the sampled set every ~2 s
+            tg = [('target', pid, pid, 'main')]
+            tg += [('target', pid, tid, 'hot') for pct, tid in sorted(hot, reverse=True)[:2] if pct >= 5]
+            tg += [(label, p, p, 'main') for p, label in self.procs.items() if p != pid and samples.get(p)]
+            self.sampler.set_targets(tg)
+        self.prev_t, self.prev_c = now, c
+        self.prev_th = {p: th for p, th in samples.items() if th is not None}
+        self.nsamples += 1
+        return True
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.sampler:
+            self.sampler.done.set()
+            self.sampler.join(1.0)
+            self.sampler.write(os.path.join(self.out, 'syscalls.csv'))
+        self.meta['end_epoch'] = time.time()
+        self.meta['samples'] = self.nsamples
+        self.tf.close(); self.cf.close()
+        with open(os.path.join(self.out, 'meta.json'), 'w') as f:
+            json.dump(self.meta, f, indent=1)
+
+
 def cmd_record(args):
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
@@ -492,98 +599,23 @@ def cmd_record(args):
     if not pid:
         print('threadwatch: no target found', file=sys.stderr)
         return 1
-    os.makedirs(args.out, exist_ok=True)
-    stat = read(f'/proc/{pid}/stat')
-    if not stat:
+    try:
+        rec = Recorder(pid, args.out, args.interval, args, args.syscalls)
+    except ProcessLookupError:
         print(f'threadwatch: pid {pid} vanished', file=sys.stderr)
         return 1
-    comm, _ = parse_stat(stat)
-    meta = {
-        'tool': 'threadwatch', 'version': 2, 'pid': pid, 'comm': comm,
-        'cmdline': (read(f'/proc/{pid}/cmdline') or '').replace('\0', ' ').strip(),
-        'interval_s': args.interval, 'clk_tck': CLK_TCK, 'ncpu': NCPU,
-        'start_epoch': time.time(), 'topology': topology(), 'also': args.also or [],
-        'syscall_hz': args.syscalls or 0, 'also_seen': {},
-        'steam_appid': steam_appid(pid), 'game': steam_game_name(steam_appid(pid)),
-    }
-    game = f" - {game_label(pid)}" if steam_appid(pid) else ''
-    print(f'threadwatch: following pid {pid} ({comm}){game} -> {args.out}', file=sys.stderr)
-
-    tf = open(os.path.join(args.out, 'threads.csv'), 'w', newline='')
-    cf = open(os.path.join(args.out, 'cores.csv'), 'w', newline='')
-    tw, cw = csv.writer(tf), csv.writer(cf)
-    tw.writerow(['t', 'tid', 'comm', 'state', 'cpu', 'cpu_pct', 'vcs_per_s', 'nvcs_per_s', 'allowed', 'proc', 'pid'])
-    cw.writerow(['t', 'cpu', 'busy_pct'])
-
-    t0 = time.monotonic()
-    sampler = None
-    if args.syscalls:
-        sampler = SyscallSampler(args.syscalls, t0)
-        sampler.set_targets([('target', pid, pid, 'main')])
-        sampler.start()
-    procs = {pid: 'target'}  # pid -> label
-    for label, p in companions(args, pid):
-        procs[p] = label
-        meta['also_seen'][str(p)] = label
-    prev_t = t0
-    prev_th = {p: thread_sample(p) or {} for p in procs}
-    prev_c = cpu_times()
-    nsamples, last_also = 0, t0
-    while not _stop:
-        time.sleep(args.interval)
-        now = time.monotonic()
-        if now - last_also >= 2.0:
-            last_also = now
-            for label, p in companions(args, pid):
-                if p not in procs:
-                    procs[p] = label
-                    meta['also_seen'][str(p)] = label
-                    prev_th[p] = thread_sample(p) or {}
-        samples = {p: thread_sample(p) for p in procs}
-        if samples[pid] is None:
-            break  # target exited
-        c = cpu_times()
-        dt = now - prev_t
-        t = round(now - t0, 3)
-        hot = []
-        for p, th in samples.items():
-            if th is None:
-                continue
-            label = procs[p]
-            for tid, s in th.items():
-                q = prev_th.get(p, {}).get(tid)
-                if q is None:
-                    continue  # new thread: needs two samples for deltas
-                pct = round(100.0 * (s['ticks'] - q['ticks']) / CLK_TCK / dt, 1)
-                tw.writerow([t, tid, s['comm'], s['state'], s['cpu'], pct,
-                             round((s['vcs'] - q['vcs']) / dt, 1), round((s['nvcs'] - q['nvcs']) / dt, 1),
-                             s['allowed'], label, p])
-                if p == pid and tid != pid:
-                    hot.append((pct, tid))
-        for cpu, (busy, total) in c.items():
-            pb, pt = prev_c.get(cpu, (busy, total))
-            if total > pt:
-                cw.writerow([t, cpu, round(100.0 * (busy - pb) / (total - pt), 1)])
-        if sampler and nsamples % 8 == 0:  # refresh the sampled set every ~2 s
-            tg = [('target', pid, pid, 'main')]
-            tg += [('target', pid, tid, 'hot') for pct, tid in sorted(hot, reverse=True)[:2] if pct >= 5]
-            tg += [(label, p, p, 'main') for p, label in procs.items() if p != pid and samples.get(p)]
-            sampler.set_targets(tg)
-        prev_t, prev_c = now, c
-        prev_th = {p: th for p, th in samples.items() if th is not None}
-        nsamples += 1
-        if args.duration and now - t0 >= args.duration:
-            break
-    if sampler:
-        sampler.done.set()
-        sampler.join(1.0)
-        sampler.write(os.path.join(args.out, 'syscalls.csv'))
-    meta['end_epoch'] = time.time()
-    meta['samples'] = nsamples
-    tf.close(); cf.close()
-    with open(os.path.join(args.out, 'meta.json'), 'w') as f:
-        json.dump(meta, f, indent=1)
-    print(f'threadwatch: {nsamples} samples written', file=sys.stderr)
+    game = f" - {game_label(pid)}" if rec.meta['steam_appid'] else ''
+    print(f'threadwatch: following pid {pid} ({rec.comm}){game} -> {args.out}', file=sys.stderr)
+    try:
+        while not _stop:
+            time.sleep(args.interval)
+            if not rec.step():
+                break
+            if args.duration and rec.elapsed() >= args.duration:
+                break
+    finally:
+        rec.close()
+    print(f'threadwatch: {rec.nsamples} samples written', file=sys.stderr)
     return 0
 
 
@@ -718,7 +750,8 @@ def cmd_summary(args):
         report['also'][proc] = {'cores_busy': round(sum(p['cpu'] / max(1, p['n']) for p in th.values()) / 100.0, 3),
                                 'threads': [thread_dict(tid, p) for tid, p in sorted(th.items(), key=lambda kv: -kv[1]['cpu'])[:3]]}
         cores = sum(p['cpu'] / max(1, p['n']) for p in th.values()) / 100.0
-        line = f"\n**{proc}** (--also): {len(th)} threads, avg {cores:.2f} cores busy"
+        how = '--also' if meta.get('also') else "the game's own wineserver" if meta.get('steam_appid') else 'extra process'
+        line = f"\n**{proc}** ({how}): {len(th)} threads, avg {cores:.2f} cores busy"
         if fps:
             line += f", {cores / fps * 1000:.2f} ms CPU per frame"
         out.append(line)
@@ -987,6 +1020,25 @@ class LiveModel:
         return max(tgt, key=lambda r: r['avg']) if tgt else None
 
 
+class RecThread(threading.Thread):
+    """Runs a Recorder at its own interval for top's record key; closes it when stopped or the target exits."""
+
+    def __init__(self, rec):
+        super().__init__(daemon=True)
+        self.rec, self.stop_evt, self.ended = rec, threading.Event(), None
+
+    def run(self):
+        try:
+            while not self.stop_evt.wait(self.rec.interval):
+                if not self.rec.step():
+                    self.ended = 'the target exited'
+                    break
+        except Exception as e:  # keep what was recorded so far
+            self.ended = f'{type(e).__name__}: {e}'
+        finally:
+            self.rec.close()
+
+
 class TopUI:
     def __init__(self, scr, args):
         import curses
@@ -997,6 +1049,7 @@ class TopUI:
         self.xmax = None  # right clip for put(), used while drawing a row with a right-aligned tail
         self.finder, self.found, self.status = None, None, ''
         self.notice, self.sw_prev, self.sw_next = None, None, 0.0
+        self.rec, self.saved = None, []  # RecThread; [(dir, seconds, samples)] saved this session
         self.sys = None
         if args.syscalls:
             self.sys = LiveSyscalls(args.syscalls)
@@ -1103,6 +1156,8 @@ class TopUI:
             if read(f'/proc/{self.found}/stat'):
                 m.reset(self.found)
                 self.status = ''
+                if self.args.record:
+                    self.start_recording()
             else:
                 self.status = f'pid {self.found} not found'
                 self.found = -1
@@ -1155,6 +1210,11 @@ class TopUI:
         el = int(time.monotonic() - m.started)
         tail = ('PAUSED  ' if self.paused else '') + f'{self.model.interval:g}s  {el // 60}:{el % 60:02d}'
         self.put(r1, w - 2 - len(tail), tail, A['orange'] if self.paused else A['dim'])
+        if self.rec:
+            rs = int(self.rec.rec.elapsed())
+            rec_s = f'● REC {rs // 60}:{rs % 60:02d}  '
+            tail = rec_s + tail
+            self.put(r1, w - 2 - len(tail), rec_s, A['red'] | self.c.A_BOLD)
         self.xmax = w - 4 - len(tail)  # row 1 content stops before the tail
         x = self.put(r1, x, m.comm, A['title'])
         x = self.put(r1, x, f'  pid {m.pid}', A['dim'])
@@ -1348,16 +1408,20 @@ class TopUI:
     def draw_footer(self, y, w):
         A = self.A
         self.put(y, 0, ' ' * w, A['hdr'])
-        x = 1
-        for k, label in (('q', 'Quit'), ('s', f'Sort:{self.sort}'), ('a', 'All' if self.show_all else 'Active'),
-                         ('p', 'Resume' if self.paused else 'Pause'), ('↑↓', 'Select'), ('+/-', 'Interval'),
-                         ('?', 'Explain')):
-            x = self.put(y, x, k, A['key'])
-            x = self.put(y, x, f' {label}  ', A['hdr'])
+        keys = [('q', 'Quit'), ('s', f'Sort:{self.sort}'), ('a', 'All' if self.show_all else 'Active'),
+                ('p', 'Resume' if self.paused else 'Pause'), ('r', 'Stop rec' if self.rec else 'Record'),
+                ('↑↓', 'Select'), ('+/-', 'Interval'), ('?', 'Explain')]
         hidden = len(self.model.rows) - len(self.visible_rows())
         msg = f'{hidden} idle threads hidden ' if hidden > 0 else ''
         if self.notice and time.monotonic() < self.notice[1]:
             msg = f'{self.notice[0]}   {msg}'
+        width = lambda ks: 1 + sum(len(k) + len(label) + 3 for k, label in ks)
+        if msg and width(keys) + len(msg) + 1 > w:  # a message wins over the less important key hints
+            keys = [kv for kv in keys if kv[0] in ('q', 'r', '?')]
+        x = 1
+        for k, label in keys:
+            x = self.put(y, x, k, A['key'])
+            x = self.put(y, x, f' {label}  ', A['hdr'])
         if msg:
             self.put(y, max(x, w - len(msg) - 1), msg, A['hdr'])
 
@@ -1378,7 +1442,9 @@ class TopUI:
         ('', 'thread (competes with it), spin? = busy with many voluntary switches.'),
         ('blocked in', 'with --syscalls HZ: what the selected thread is doing when sampled (last 5 s).'),
         ('Keys', 'q quit  s sort  a all/active threads  p pause  ↑↓ PgUp PgDn Home End select  +/- interval'),
-        ('', 'Hints are heuristics. Record with `threadwatch record` for numbers you can quote.'),
+        ('r', 'start/stop a recording: the same files as `threadwatch record` (summary works on it), at'),
+        ('', '--rec-interval (0.25 s), into --rec-dir; stopped and saved on quit or when the target exits.'),
+        ('', 'Hints are heuristics. Record (r, or `threadwatch record`) for numbers you can quote.'),
     ]
 
     def draw_help(self, h, w):
@@ -1444,7 +1510,46 @@ class TopUI:
             self.model.interval = max(0.25, self.model.interval / 2)
         elif ch == ord('?'):
             self.help = True
+        elif ch == ord('r'):
+            if self.rec:
+                self.stop_recording()
+            else:
+                self.start_recording()
         return True
+
+    def start_recording(self):
+        m, args = self.model, self.args
+        if self.rec or not m.pid or m.exited:
+            if not m.pid or m.exited:
+                self.notice = ('nothing to record yet', time.monotonic() + 5)
+            return
+        name = re.sub(r'[^A-Za-z0-9._-]+', '_', m.comm) or 'target'
+        base = os.path.join(args.rec_dir, f'threadwatch-{name}-{time.strftime("%Y%m%d-%H%M%S")}')
+        out, n = base, 2
+        while os.path.exists(out):
+            out, n = f'{base}-{n}', n + 1
+        try:
+            rec = Recorder(m.pid, out, args.rec_interval, args, args.syscalls, source='top')
+        except (OSError, ProcessLookupError) as e:
+            self.notice = (f'cannot record: {e}', time.monotonic() + 10)
+            return
+        self.rec = RecThread(rec)
+        self.rec.start()
+        self.notice = (f'recording to {os.path.basename(out)}/', time.monotonic() + 5)
+
+    def stop_recording(self, why=''):
+        """Stop (if running) or collect (if it ended on its own) the recording, and say where it went."""
+        if not self.rec:
+            return
+        rt, self.rec = self.rec, None
+        rt.stop_evt.set()
+        rt.join(5.0)
+        rec = rt.rec
+        secs = (rec.meta.get('end_epoch') or time.time()) - rec.meta['start_epoch']
+        self.saved.append((rec.out, secs, rec.nsamples))
+        why = why or (f'stopped: {rt.ended}' if rt.ended else '')
+        self.notice = (f"saved {secs:.0f} s to {os.path.basename(rec.out)}/" + (f' ({why})' if why else ''),
+                       time.monotonic() + 20)
 
     def maybe_switch(self):
         """Default (Steam) mode: move to another process of the same game when it is clearly busier,
@@ -1468,9 +1573,12 @@ class TopUI:
         best = max((p for p in delta if p != m.pid), key=lambda p: delta[p], default=None)
         if best and delta[best] > max(2 * delta.get(m.pid, 0), 0.5 * CLK_TCK * dt):
             old = m.comm
+            self.stop_recording(f'target changed to {table[best][1]}')
             m.reset(best)
             self.sel_key, self.offset, self.sw_prev = None, 0, None
             self.notice = (f'switched from {old} to busier {m.comm}', now + 15)
+            if self.args.record:
+                self.start_recording()
 
     def update_syscall_targets(self):
         if not self.sys or not self.model.pid:
@@ -1484,10 +1592,18 @@ class TopUI:
         self.sys.set_targets(sorted(tg))
 
     def run(self):
+        try:
+            return self._run()
+        finally:
+            self.stop_recording('quit')  # never lose a recording on q, Ctrl+C or SIGTERM
+
+    def _run(self):
         self.start_finder()
         self.scr.timeout(100)
         next_sample = 0.0
         while not _stop:
+            if self.rec and not self.rec.is_alive():
+                self.stop_recording()  # it ended on its own (target exited)
             self.poll_target()
             self.maybe_switch()
             now = time.monotonic()
@@ -1516,13 +1632,23 @@ def cmd_top(args):
         print('threadwatch top needs a terminal', file=sys.stderr)
         return 1
     os.environ.setdefault('ESCDELAY', '25')  # Esc quits; curses otherwise waits 1 s to rule out an escape sequence
+    holder = {}
+
+    def go(scr):
+        holder['ui'] = TopUI(scr, args)
+        return holder['ui'].run()
+    rc = 0
     try:
-        return curses.wrapper(lambda scr: TopUI(scr, args).run())
+        rc = curses.wrapper(go)
     except KeyboardInterrupt:
-        return 0
+        pass
     finally:
         global _stop
         _stop = True  # ends a finder thread still waiting for a target
+    for out, secs, n in getattr(holder.get('ui'), 'saved', []):
+        print(f'threadwatch: saved {secs:.0f} s ({n} samples) to {out}  ->  threadwatch summary {shlex.quote(out)}',
+              file=sys.stderr)
+    return rc
 
 
 def main():
@@ -1556,20 +1682,22 @@ def main():
         'top', help='live per-thread view in the terminal (default: the running Steam game)', formatter_class=argparse.RawDescriptionHelpFormatter,
         description='Live terminal view: per-core load grouped by L3 cache, a sortable thread table and an\n'
                     'inspector for the selected thread. Without --pid/--name/--root it follows the running\n'
-                    'Steam game. Records nothing; use `record` for numbers you can quote.',
+                    'Steam game. Press r to record what you are watching (same files as `record`).',
         epilog="""keys:
   up/down, j/k, PgUp/PgDn, Home/End   select a thread
   s     cycle sort: cpu, peak, vol, invol, tid, name
   a     show all threads / only active ones
   p     pause / resume (space works too)
   + -   double / halve the refresh interval
+  r     start / stop a recording (saved in --rec-dir; `threadwatch summary DIR` reads it)
   ?     explain every column
-  q     quit (Esc works too)
+  q     quit (Esc works too; a running recording is saved first)
 
 examples:
   threadwatch top                          the running Steam game (waits for one)
   threadwatch top --syscalls 1000          plus what the selected thread is blocked in
   threadwatch top --name 'Game\\.exe'       any process by name (non-Steam games, emulators...)
+  threadwatch top --record --rec-dir ~/runs  record each game it follows, until it exits
   threadwatch top --pid 12345 -i 0.5""")
     t.add_argument('--pid', type=int, help='watch this process')
     t.add_argument('--name', help='regex on process name / argv0 basename (waits for it, follows restarts)')
@@ -1579,6 +1707,10 @@ examples:
     t.add_argument('--syscalls', type=float, metavar='HZ', default=0,
                    help='sample what the selected, main and 2 busiest threads are blocked in (e.g. 1000)')
     t.add_argument('-i', '--interval', type=float, default=1.0, help='seconds between refreshes (default 1)')
+    t.add_argument('--record', action='store_true', help='start recording as soon as a target is found (r toggles)')
+    t.add_argument('--rec-dir', default='.', metavar='DIR', help='where r saves recordings (default: current directory)')
+    t.add_argument('--rec-interval', type=float, default=0.25, metavar='SECS',
+                   help='sampling interval of recordings (default 0.25, like record)')
     t.add_argument('--wait', type=float, default=0, help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.cmd in ('record', 'top') and a.appid and not is_auto(a):
