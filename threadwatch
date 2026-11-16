@@ -188,10 +188,12 @@ def steam_appid(pid, starttime=None, comm=None):
     image: keyed on start time and comm, because exec keeps the pid and start time but changes comm."""
     if starttime is None or comm is None:
         st = read(f'/proc/{pid}/stat')
+        if not st:
+            return None  # the process has exited
         try:
             comm, f = parse_stat(st)
             starttime = int(f[19])
-        except (TypeError, ValueError, IndexError):
+        except (ValueError, IndexError):
             return None
     key = (starttime, comm)
     hit = _appid_cache.get(pid)
@@ -1452,6 +1454,8 @@ class TopUI:
             return
         self.sw_next = now + 5.0
         table = proc_table()
+        if m.pid not in table:
+            return  # the target just exited; the next sample notices and handles it
         appid = self.args.appid or steam_appid(m.pid)
         ticks = {p: table[p][2] for p, _, _ in steam_candidates(table, appid)}
         if m.pid in table:
