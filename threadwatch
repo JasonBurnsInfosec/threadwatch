@@ -1,0 +1,647 @@
+#!/usr/bin/env python3
+"""threadwatch - per-thread CPU sampler for diagnosing CPU-bound games (Proton/Wine or native).
+
+  threadwatch record  (--pid PID | --name REGEX | --root PID [--name REGEX]) [--also REGEX]...
+                      [--syscalls HZ] [-o DIR] [-i SECS] [-d SECS]
+  threadwatch summary DIR [--window FILE | --from S --to S] [--fps N] [--top N] [--markdown]
+
+record samples every thread of the target process from /proc: CPU%, state, last core,
+allowed cores and voluntary/involuntary context switches, plus per-core busy% and the
+CPU cache/SMT topology. Output: DIR/threads.csv, DIR/cores.csv, DIR/meta.json
+(and DIR/syscalls.csv with --syscalls).
+
+Target selection:
+  --pid PID            follow that process
+  --name REGEX         wait for a process whose name/argv0 matches (case-insensitive)
+  --root PID           only consider descendants of PID (e.g. a launch wrapper); without
+                       --name, auto-pick the busiest descendant, preferring *.exe
+  --also REGEX         also record every process whose name matches (e.g. wineserver);
+                       repeatable; looked up system-wide every 2 s
+  --syscalls HZ        sample what threads are blocked in (/proc/<pid>/task/<tid>/syscall) at
+                       HZ: the target's main thread, its 2 busiest threads and the main thread of
+                       each --also process. i386 and x86_64 syscall tables (32-bit Wine processes
+                       use i386 numbers); ntsync ioctls are decoded; read/write fds are resolved.
+
+summary reads DIR/../window.json (written by `benchsum --write-window` / gamerun) when present,
+so it covers the same benchmark window as the FPS numbers; --no-window disables that.
+--fps (or the window's avg_fps) adds per-frame CPU time and context switches.
+Stdlib only. No root needed for your own processes.
+"""
+import argparse, csv, json, os, re, signal, sys, threading, time
+from collections import Counter, defaultdict
+
+CLK_TCK = os.sysconf('SC_CLK_TCK')
+NCPU = os.cpu_count()
+_stop = False
+
+
+def _on_signal(*_):
+    global _stop
+    _stop = True
+
+
+# ---------------------------------------------------------------- /proc helpers
+def read(path):
+    try:
+        with open(path, 'rb') as f:
+            return f.read().decode('utf-8', 'replace')
+    except OSError:
+        return None
+
+
+def parse_stat(text):
+    """Return (comm, fields-after-comm) from a /proc stat line; comm may contain spaces/parens."""
+    l, r = text.index('('), text.rindex(')')
+    return text[l + 1:r], text[r + 2:].split()
+
+
+def proc_table():
+    """pid -> (ppid, comm, cputicks) for all processes."""
+    out = {}
+    for d in os.listdir('/proc'):
+        if not d.isdigit():
+            continue
+        t = read(f'/proc/{d}/stat')
+        if not t:
+            continue
+        try:
+            comm, f = parse_stat(t)
+            out[int(d)] = (int(f[1]), comm, int(f[11]) + int(f[12]))
+        except (ValueError, IndexError):
+            pass
+    return out
+
+
+def descendants(root, table):
+    kids = defaultdict(list)
+    for pid, (ppid, _, _) in table.items():
+        kids[ppid].append(pid)
+    out, todo = set(), [root]
+    while todo:
+        p = todo.pop()
+        for c in kids.get(p, ()):
+            if c not in out:
+                out.add(c)
+                todo.append(c)
+    return out
+
+
+def proc_names(pid, comm):
+    """Names a user might match on: comm and basename of argv0 (Wine puts the .exe path there)."""
+    names = [comm]
+    cmd = read(f'/proc/{pid}/cmdline')
+    if cmd:
+        argv0 = cmd.split('\0')[0]
+        names.append(re.split(r'[\\/]', argv0)[-1])
+    return names
+
+
+def find_target(args):
+    """Block until a target process is found; return pid or None on stop/timeout."""
+    pat = re.compile(args.name, re.I) if args.name else None
+    deadline = time.time() + args.wait if args.wait else None
+    started = time.time()
+    prev = {}
+    while not _stop and (deadline is None or time.time() < deadline):
+        table = proc_table()
+        if args.root and args.root not in table:
+            return None  # root exited before a target appeared
+        pool = descendants(args.root, table) if args.root else set(table)
+        pool.discard(os.getpid())
+        if pat:
+            for pid in sorted(pool):
+                if any(pat.search(n) for n in proc_names(pid, table[pid][1])):
+                    return pid
+        else:  # auto: busiest descendant over the last ~1 s
+            best_exe, best_exe_d, best_any, best_any_d = None, 0, None, 0
+            for pid in pool:
+                ticks = table[pid][2]
+                delta = ticks - prev.get(pid, ticks)
+                if any(n.lower().endswith('.exe') for n in proc_names(pid, table[pid][1])):
+                    if delta > best_exe_d:
+                        best_exe, best_exe_d = pid, delta
+                elif delta > best_any_d:
+                    best_any, best_any_d = pid, delta
+            prev = {p: table[p][2] for p in pool}
+            # Prefer a Windows .exe doing real work (>=0.5 core): skips launchers/wineserver.
+            if best_exe and best_exe_d >= 0.5 * CLK_TCK:
+                return best_exe
+            # No busy .exe after 20 s: probably a native game; take the busiest process (>=0.2 core).
+            if time.time() - started > 20 and best_any and best_any_d >= 0.2 * CLK_TCK:
+                return best_any
+        time.sleep(1.0)
+    return None
+
+
+def find_also(patterns, exclude):
+    """[(label, pid)] for every process matching one of the --also regexes."""
+    if not patterns:
+        return []
+    out = []
+    table = proc_table()
+    for pat in patterns:
+        rx = re.compile(pat, re.I)
+        for pid, (_, comm, _) in table.items():
+            if pid in exclude or pid == os.getpid():
+                continue
+            if any(rx.search(n) for n in proc_names(pid, comm)):
+                out.append((comm, pid))
+    return out
+
+
+def topology():
+    """Per logical CPU: physical core, package, SMT siblings, L3 sharing group."""
+    topo = {}
+    for c in range(NCPU):
+        base = f'/sys/devices/system/cpu/cpu{c}'
+        def g(p):
+            v = read(f'{base}/{p}')
+            return v.strip() if v else None
+        l3 = None
+        for idx in range(8):
+            if g(f'cache/index{idx}/level') == '3':
+                l3 = g(f'cache/index{idx}/shared_cpu_list')
+                break
+        topo[c] = {
+            'core_id': g('topology/core_id'),
+            'package': g('topology/physical_package_id'),
+            'smt_siblings': g('topology/thread_siblings_list'),
+            'l3_group': l3,
+            'cppc_highest_perf': g('acpi_cppc/highest_perf'),
+        }
+    return topo
+
+
+def cpu_times():
+    """cpu -> (busy, total) jiffies from /proc/stat."""
+    out = {}
+    for line in (read('/proc/stat') or '').splitlines():
+        if line.startswith('cpu') and line[3:4].isdigit():
+            p = line.split()
+            v = list(map(int, p[1:]))
+            idle = v[3] + (v[4] if len(v) > 4 else 0)
+            out[int(p[0][3:])] = (sum(v) - idle, sum(v))
+    return out
+
+
+def thread_sample(pid):
+    """tid -> dict for every thread of pid."""
+    out = {}
+    try:
+        tids = os.listdir(f'/proc/{pid}/task')
+    except OSError:
+        return None
+    for tid in tids:
+        st = read(f'/proc/{pid}/task/{tid}/stat')
+        if not st:
+            continue
+        try:
+            comm, f = parse_stat(st)
+            status = read(f'/proc/{pid}/task/{tid}/status') or ''
+            vcs = nvcs = 0
+            allowed = ''
+            for line in status.splitlines():
+                if line.startswith('voluntary_ctxt_switches'):
+                    vcs = int(line.split()[1])
+                elif line.startswith('nonvoluntary_ctxt_switches'):
+                    nvcs = int(line.split()[1])
+                elif line.startswith('Cpus_allowed_list'):
+                    allowed = line.split(None, 1)[1].strip()
+            out[int(tid)] = {'comm': comm, 'state': f[0], 'ticks': int(f[11]) + int(f[12]),
+                             'cpu': int(f[36]), 'vcs': vcs, 'nvcs': nvcs, 'allowed': allowed}
+        except (ValueError, IndexError):
+            continue
+    return out
+
+
+# ---------------------------------------------------------------- syscall classification
+NR64 = {0: 'read', 1: 'write', 7: 'poll', 16: 'ioctl', 19: 'readv', 20: 'writev', 23: 'select',
+        24: 'sched_yield', 35: 'nanosleep', 44: 'sendto', 45: 'recvfrom', 46: 'sendmsg', 47: 'recvmsg',
+        202: 'futex', 230: 'clock_nanosleep', 232: 'epoll_wait', 270: 'pselect6', 271: 'ppoll',
+        281: 'epoll_pwait', 441: 'epoll_pwait2', 449: 'futex_waitv'}
+NR32 = {3: 'read', 4: 'write', 54: 'ioctl', 145: 'readv', 146: 'writev', 158: 'sched_yield', 162: 'nanosleep',
+        168: 'poll', 240: 'futex', 256: 'epoll_wait', 267: 'clock_nanosleep', 309: 'ppoll', 319: 'epoll_pwait',
+        370: 'sendmsg', 372: 'recvmsg', 407: 'clock_nanosleep_time64', 414: 'ppoll_time64', 422: 'futex_time64',
+        441: 'epoll_pwait2', 449: 'futex_waitv'}
+NTSYNC = {0x80: 'CREATE_SEM', 0x81: 'SEM_RELEASE', 0x82: 'WAIT_ANY', 0x83: 'WAIT_ALL', 0x84: 'CREATE_MUTEX',
+          0x85: 'MUTEX_UNLOCK', 0x86: 'MUTEX_KILL', 0x87: 'CREATE_EVENT', 0x88: 'EVENT_SET',
+          0x89: 'EVENT_RESET', 0x8a: 'EVENT_PULSE', 0x8b: 'SEM_READ', 0x8c: 'MUTEX_READ', 0x8d: 'EVENT_READ'}
+FD_CALLS = ('read', 'write', 'readv', 'writev', 'recvmsg', 'sendmsg', 'recvfrom', 'sendto')
+
+
+class Classifier:
+    def __init__(self):
+        self.fd_cache, self.elf = {}, {}
+
+    def is32(self, pid):
+        if pid not in self.elf:
+            try:
+                with open(f'/proc/{pid}/exe', 'rb') as fh:
+                    self.elf[pid] = fh.read(5)[4] == 1
+            except OSError:
+                self.elf[pid] = False
+        return self.elf[pid]
+
+    def fdtype(self, pid, fd):
+        key = (pid, fd)
+        if key not in self.fd_cache:
+            try:
+                t = os.readlink(f'/proc/{pid}/fd/{fd}')
+            except OSError:
+                t = '?'
+            for pre, short in (('socket:', 'socket'), ('pipe:', 'pipe')):
+                if t.startswith(pre):
+                    t = short
+            if t.startswith('anon_inode:'):
+                t = t[len('anon_inode:'):]
+            self.fd_cache[key] = t
+        return self.fd_cache[key]
+
+    def classify(self, pid, line):
+        f = line.split()
+        if not f:
+            return '?'
+        if f[0] == 'running':
+            return 'running'
+        try:
+            nr = int(f[0])
+        except ValueError:
+            return f[0]
+        if nr == -1:
+            return 'running'
+        name = (NR32 if self.is32(pid) else NR64).get(nr, f'syscall {nr}')
+        args = []
+        try:
+            args = [int(x, 16) for x in f[1:7]]
+        except ValueError:
+            pass
+        if name == 'ioctl' and len(args) >= 2:
+            t = self.fdtype(pid, args[0])
+            if t.endswith('ntsync') and ((args[1] >> 8) & 0xff) == ord('N'):
+                return f"ioctl ntsync {NTSYNC.get(args[1] & 0xff, hex(args[1] & 0xff))}"
+            return f'ioctl {t}'
+        if name in FD_CALLS and args:
+            return f'{name} {self.fdtype(pid, args[0])}'
+        return name
+
+
+class SyscallSampler(threading.Thread):
+    """Samples /proc/<pid>/task/<tid>/syscall for a changing set of threads; counts per second."""
+
+    def __init__(self, hz, t0):
+        super().__init__(daemon=True)
+        self.period, self.t0 = 1.0 / hz, t0
+        self.lock = threading.Lock()
+        self.targets = []  # (proc_label, pid, tid, role)
+        self.counts = Counter()  # (sec, proc, tid, role, class) -> n
+        self.cls = Classifier()
+        self.done = threading.Event()
+
+    def set_targets(self, targets):
+        with self.lock:
+            self.targets = list(targets)
+
+    def run(self):
+        while not self.done.is_set():
+            sec = int(time.monotonic() - self.t0)
+            with self.lock:
+                targets = self.targets
+            for label, pid, tid, role in targets:
+                line = read(f'/proc/{pid}/task/{tid}/syscall')
+                if line is not None:
+                    self.counts[(sec, label, tid, role, self.cls.classify(pid, line))] += 1
+            time.sleep(self.period)
+
+    def write(self, path):
+        with open(path, 'w', newline='') as fh:
+            w = csv.writer(fh)
+            w.writerow(['sec', 'proc', 'tid', 'role', 'state', 'samples'])
+            for (sec, label, tid, role, c), n in sorted(self.counts.items()):
+                w.writerow([sec, label, tid, role, c, n])
+
+
+# ---------------------------------------------------------------- record
+def cmd_record(args):
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+    pid = args.pid or find_target(args)
+    if not pid:
+        print('threadwatch: no target found', file=sys.stderr)
+        return 1
+    os.makedirs(args.out, exist_ok=True)
+    stat = read(f'/proc/{pid}/stat')
+    if not stat:
+        print(f'threadwatch: pid {pid} vanished', file=sys.stderr)
+        return 1
+    comm, _ = parse_stat(stat)
+    meta = {
+        'tool': 'threadwatch', 'version': 2, 'pid': pid, 'comm': comm,
+        'cmdline': (read(f'/proc/{pid}/cmdline') or '').replace('\0', ' ').strip(),
+        'interval_s': args.interval, 'clk_tck': CLK_TCK, 'ncpu': NCPU,
+        'start_epoch': time.time(), 'topology': topology(), 'also': args.also or [],
+        'syscall_hz': args.syscalls or 0, 'also_seen': {},
+    }
+    print(f'threadwatch: following pid {pid} ({comm}) -> {args.out}', file=sys.stderr)
+
+    tf = open(os.path.join(args.out, 'threads.csv'), 'w', newline='')
+    cf = open(os.path.join(args.out, 'cores.csv'), 'w', newline='')
+    tw, cw = csv.writer(tf), csv.writer(cf)
+    tw.writerow(['t', 'tid', 'comm', 'state', 'cpu', 'cpu_pct', 'vcs_per_s', 'nvcs_per_s', 'allowed', 'proc', 'pid'])
+    cw.writerow(['t', 'cpu', 'busy_pct'])
+
+    t0 = time.monotonic()
+    sampler = None
+    if args.syscalls:
+        sampler = SyscallSampler(args.syscalls, t0)
+        sampler.set_targets([('target', pid, pid, 'main')])
+        sampler.start()
+    procs = {pid: 'target'}  # pid -> label
+    for label, p in find_also(args.also, {pid}):
+        procs[p] = label
+        meta['also_seen'][str(p)] = label
+    prev_t = t0
+    prev_th = {p: thread_sample(p) or {} for p in procs}
+    prev_c = cpu_times()
+    nsamples, last_also = 0, t0
+    while not _stop:
+        time.sleep(args.interval)
+        now = time.monotonic()
+        if args.also and now - last_also >= 2.0:
+            last_also = now
+            for label, p in find_also(args.also, {pid}):
+                if p not in procs:
+                    procs[p] = label
+                    meta['also_seen'][str(p)] = label
+                    prev_th[p] = thread_sample(p) or {}
+        samples = {p: thread_sample(p) for p in procs}
+        if samples[pid] is None:
+            break  # target exited
+        c = cpu_times()
+        dt = now - prev_t
+        t = round(now - t0, 3)
+        hot = []
+        for p, th in samples.items():
+            if th is None:
+                continue
+            label = procs[p]
+            for tid, s in th.items():
+                q = prev_th.get(p, {}).get(tid)
+                if q is None:
+                    continue  # new thread: needs two samples for deltas
+                pct = round(100.0 * (s['ticks'] - q['ticks']) / CLK_TCK / dt, 1)
+                tw.writerow([t, tid, s['comm'], s['state'], s['cpu'], pct,
+                             round((s['vcs'] - q['vcs']) / dt, 1), round((s['nvcs'] - q['nvcs']) / dt, 1),
+                             s['allowed'], label, p])
+                if p == pid and tid != pid:
+                    hot.append((pct, tid))
+        for cpu, (busy, total) in c.items():
+            pb, pt = prev_c.get(cpu, (busy, total))
+            if total > pt:
+                cw.writerow([t, cpu, round(100.0 * (busy - pb) / (total - pt), 1)])
+        if sampler and nsamples % 8 == 0:  # refresh the sampled set every ~2 s
+            tg = [('target', pid, pid, 'main')]
+            tg += [('target', pid, tid, 'hot') for pct, tid in sorted(hot, reverse=True)[:2] if pct >= 5]
+            tg += [(label, p, p, 'main') for p, label in procs.items() if p != pid and samples.get(p)]
+            sampler.set_targets(tg)
+        prev_t, prev_c = now, c
+        prev_th = {p: th for p, th in samples.items() if th is not None}
+        nsamples += 1
+        if args.duration and now - t0 >= args.duration:
+            break
+    if sampler:
+        sampler.done.set()
+        sampler.join(1.0)
+        sampler.write(os.path.join(args.out, 'syscalls.csv'))
+    meta['end_epoch'] = time.time()
+    meta['samples'] = nsamples
+    tf.close(); cf.close()
+    with open(os.path.join(args.out, 'meta.json'), 'w') as f:
+        json.dump(meta, f, indent=1)
+    print(f'threadwatch: {nsamples} samples written', file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------- summary
+def resolve_window(args, meta):
+    """Return ((t_from, t_to, description), window.json-dict-or-None); times in seconds since record start."""
+    if args.t_from is not None or args.t_to is not None:
+        return (args.t_from or 0.0, args.t_to if args.t_to is not None else float('inf'), 'manual --from/--to'), None
+    path = args.window
+    if not path and not args.no_window:
+        cand = os.path.join(os.path.dirname(os.path.abspath(args.dir)), 'window.json')
+        path = cand if os.path.exists(cand) else None
+    if path:
+        w = json.load(open(path))
+        if w.get('start_epoch') and w.get('end_epoch'):
+            return (w['start_epoch'] - meta['start_epoch'], w['end_epoch'] - meta['start_epoch'],
+                    f"{w.get('source', 'window')} from {os.path.basename(path)}"), w
+    return (0.0, float('inf'), 'whole recording'), None
+
+
+def cmd_summary(args):
+    d = args.dir
+    meta = json.load(open(os.path.join(d, 'meta.json')))
+    (t_from, t_to, wdesc), wfile = resolve_window(args, meta)
+    fps = args.fps or (wfile or {}).get('avg_fps')
+    topo = {int(k): v for k, v in meta['topology'].items()}
+    phys = {c: (v['package'], v['core_id']) for c, v in topo.items()}
+    l3 = {c: v['l3_group'] for c, v in topo.items()}
+    target_pid = meta['pid']
+
+    per = defaultdict(lambda: {'comm': '', 'proc': 'target', 'n': 0, 'cpu': 0.0, 'peak': 0.0, 'running': 0,
+                               'cores': set(), 'migr': 0, 'last': None, 'vcs': 0.0, 'nvcs': 0.0,
+                               'allowed': Counter()})
+    by_t = defaultdict(list)
+    for r in csv.DictReader(open(os.path.join(d, 'threads.csv'))):
+        t = float(r['t'])
+        if not (t_from <= t <= t_to):
+            continue
+        proc = r.get('proc') or 'target'
+        tid, pct, cpu = int(r['tid']), float(r['cpu_pct']), int(r['cpu'])
+        p = per[(proc, tid)]
+        p['comm'] = r['comm'] or '(unnamed)'; p['proc'] = proc
+        p['n'] += 1; p['cpu'] += pct; p['peak'] = max(p['peak'], pct)
+        p['running'] += r['state'] == 'R'
+        if pct > 1.0:
+            p['cores'].add(cpu)
+            if p['last'] is not None and p['last'] != cpu:
+                p['migr'] += 1
+            p['last'] = cpu
+        p['vcs'] += float(r['vcs_per_s']); p['nvcs'] += float(r['nvcs_per_s'])
+        p['allowed'][r['allowed']] += 1
+        if proc == 'target':
+            by_t[t].append((tid, pct, cpu))
+
+    if not per:
+        print(f'threadwatch: no samples in window ({wdesc})', file=sys.stderr)
+        return 1
+    nt = max(1, len(by_t))
+    dur = (max(by_t) - min(by_t)) if len(by_t) > 1 else 0
+    target = {k: v for k, v in per.items() if v['proc'] == 'target'}
+    total_cores = sum(p['cpu'] for p in target.values()) / 100.0 / nt
+
+    # Hot threads sharing a physical core (SMT siblings) or the same logical CPU.
+    same_lcpu = same_phys = hot_samples = 0
+    for rows in by_t.values():
+        hot = [(tid, cpu) for tid, pct, cpu in rows if pct >= 50]
+        if len(hot) < 2:
+            continue
+        hot_samples += 1
+        cpus = [c for _, c in hot]
+        if len(set(cpus)) < len(cpus):
+            same_lcpu += 1
+        ph = [phys.get(c) for c in cpus]
+        if len(set(ph)) < len(ph):
+            same_phys += 1
+
+    core_busy = defaultdict(list)
+    cpath = os.path.join(d, 'cores.csv')
+    if os.path.exists(cpath):
+        for r in csv.DictReader(open(cpath)):
+            if t_from <= float(r['t']) <= t_to:
+                core_busy[int(r['cpu'])].append(float(r['busy_pct']))
+    avg_core = {c: sum(v) / len(v) for c, v in core_busy.items() if v}
+
+    md = args.markdown
+    def tbl(hdr, rows):
+        if md:
+            return ['| ' + ' | '.join(hdr) + ' |', '|' + '---|' * len(hdr)] + ['| ' + ' | '.join(map(str, r)) + ' |' for r in rows]
+        w = [max(len(str(x)) for x in col) for col in zip(hdr, *rows)] if rows else [len(h) for h in hdr]
+        line = lambda r: '  '.join(str(x).rjust(w[i]) if i not in (1,) else str(x).ljust(w[i]) for i, x in enumerate(r))
+        return [line(hdr)] + [line(r) for r in rows]
+
+    def thread_row(tid, p):
+        n = max(1, p['n'])
+        row = [tid, p['comm'][:22], f"{p['cpu'] / n:.1f}", f"{p['peak']:.0f}", f"{100 * p['running'] / n:.0f}",
+               len(p['cores']), f"{p['migr'] / dur:.2f}" if dur else '0', f"{p['vcs'] / n:.0f}", f"{p['nvcs'] / n:.0f}",
+               p['allowed'].most_common(1)[0][0]]
+        if fps:
+            row += [f"{p['cpu'] / n / 100 / fps * 1000:.2f}", f"{p['vcs'] / n / fps:.0f}"]
+        return row
+
+    hdr = ['tid', 'thread', 'avg CPU%', 'peak%', 'running%', 'cores used', 'migr/s', 'vol cs/s', 'invol cs/s', 'allowed']
+    if fps:
+        hdr += ['CPU ms/frame', 'vol cs/frame']
+    out = [f"**{meta['comm']}** (pid {target_pid}): window {wdesc}, {dur:.0f} s, {nt} samples @ {meta['interval_s']} s, "
+           f"{len(target)} threads seen, avg {total_cores:.2f} cores busy of {meta['ncpu']}"
+           + (f", per-frame figures at {fps:.2f} FPS" if fps else ''), '']
+    rows = sorted(target.items(), key=lambda kv: -kv[1]['cpu'])[:args.top]
+    out += tbl(hdr, [thread_row(tid, p) for (_, tid), p in rows])
+
+    # --also processes (e.g. wineserver): totals and busiest threads
+    others = defaultdict(dict)
+    for (proc, tid), p in per.items():
+        if proc != 'target':
+            others[proc][tid] = p
+    for proc, th in others.items():
+        cores = sum(p['cpu'] / max(1, p['n']) for p in th.values()) / 100.0
+        line = f"\n**{proc}** (--also): {len(th)} threads, avg {cores:.2f} cores busy"
+        if fps:
+            line += f", {cores / fps * 1000:.2f} ms CPU per frame"
+        out.append(line)
+        out += tbl(hdr, [thread_row(tid, p) for tid, p in sorted(th.items(), key=lambda kv: -kv[1]['cpu'])[:3]])
+
+    # syscall profile
+    spath = os.path.join(d, 'syscalls.csv')
+    if os.path.exists(spath):
+        prof = defaultdict(Counter)
+        for r in csv.DictReader(open(spath)):
+            if t_from <= int(r['sec']) <= t_to:
+                key = f"{r['proc']} {r['role']} thread" + ('' if r['role'] == 'main' else f" {r['tid']}")
+                prof[key][r['state']] += int(r['samples'])
+        out.append(f"\nWhere threads are blocked (sampled at {meta.get('syscall_hz')} Hz, % of wall time):")
+        for key, c in sorted(prof.items(), key=lambda kv: (not kv[0].startswith('target main'), kv[0])):
+            tot = sum(c.values())
+            if tot < 50:
+                continue
+            parts = ', '.join(f'{100 * v / tot:.1f}% {k}' for k, v in c.most_common(6))
+            out.append(f'- {key} ({tot} samples): {parts}')
+
+    out.append('')
+    if hot_samples:
+        out.append(f'Hot-thread placement (samples with >=2 threads >=50% CPU: {hot_samples}): '
+                   f'same logical CPU {100 * same_lcpu / hot_samples:.0f}%, '
+                   f'same physical core (SMT siblings) {100 * same_phys / hot_samples:.0f}%')
+    allowed = Counter()
+    for p in target.values():
+        allowed[p['allowed'].most_common(1)[0][0]] += 1
+    if allowed:
+        out.append('Allowed-CPU masks (threads): ' + ', '.join(f'{m} ×{n}' for m, n in sorted(allowed.items())))
+    if avg_core:
+        groups = defaultdict(list)
+        for c, v in avg_core.items():
+            groups[l3.get(c) or '?'].append(v)
+        parts = [f'L3[{g}] {sum(v) / len(v):.0f}%' for g, v in sorted(groups.items(), key=lambda kv: kv[0])]
+        out.append('Avg busy per L3 group (system-wide): ' + ', '.join(parts))
+        idle = sum(1 for v in avg_core.values() if v < 10)
+        out.append(f'Logical CPUs averaging <10% busy: {idle} of {len(avg_core)}')
+
+    # Heuristic hints: things worth a closer look, not conclusions.
+    hints = []
+    spin = [p for _, p in rows if p['cpu'] / max(1, p['n']) > 80 and p['vcs'] / max(1, p['n']) > 1000]
+    if spin:
+        hints.append(f'{len(spin)} thread(s) >80% CPU with >1000 voluntary switches/s: possible spin/yield loops '
+                     '(check with perf).')
+    if hot_samples and same_phys / hot_samples > 0.2:
+        hints.append('Busy threads often share a physical core: check affinity masks / reported topology.')
+    top = rows[0][1] if rows else None
+    if top and top['cpu'] / max(1, top['n']) > 90 and total_cores < 3:
+        which = 'the main thread' if rows[0][0][1] == target_pid else f"thread {rows[0][0][1]} ({top['comm']})"
+        hints.append(f'One thread near 100% while few cores are busy: likely bound by {which}.')
+    if top:
+        tmask = top['allowed'].most_common(1)[0][0]
+        if tmask and tmask != f'0-{meta["ncpu"] - 1}':
+            sharers = [p for (_, tid), p in target.items() if p is not top and p['allowed'].most_common(1)[0][0] == tmask]
+            busy = [p for p in sharers if p['cpu'] / max(1, p['n']) >= 1.0]
+            if sharers:
+                hints.append(f"Hottest thread is restricted to CPUs {tmask}, and {len(sharers)} other thread(s) share that mask "
+                             f"({len(busy)} using >=1% CPU: {', '.join(p['comm'] for p in busy[:5]) or '-'}). Threads created "
+                             "by a pinned thread inherit its mask (overlays, driver threads) and compete with it.")
+    main_prof = None
+    if os.path.exists(spath):
+        main_prof = next((c for k, c in prof.items() if k.startswith('target main')), None)
+    if main_prof:
+        tot = sum(main_prof.values())
+        server = sum(v for k, v in main_prof.items() if k.startswith(('readv pipe', 'read pipe', 'recvmsg socket')))
+        if tot and server / tot > 0.05:
+            hints.append(f'Main thread spends {100 * server / tot:.0f}% of wall time waiting on a pipe/socket read; in Wine '
+                         'that is usually a wineserver reply (count requests with WINEDEBUG=+server).')
+    if hints:
+        out.append('')
+        out.append('Hints (heuristics, verify before concluding):')
+        out += [f'- {h}' for h in hints]
+    print('\n'.join(out))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='threadwatch', description=__doc__.split('\n')[0])
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    r = sub.add_parser('record', help='sample a process')
+    g = r.add_mutually_exclusive_group()
+    g.add_argument('--pid', type=int, help='follow this process')
+    r.add_argument('--name', help='regex on process name / argv0 basename')
+    r.add_argument('--root', type=int, help='restrict search to descendants of this pid')
+    r.add_argument('--also', action='append', metavar='REGEX', help='also record processes matching REGEX (repeatable)')
+    r.add_argument('--syscalls', type=float, metavar='HZ', default=0, help='sample blocked-in syscalls at HZ (e.g. 1000)')
+    r.add_argument('-o', '--out', default=f'threadwatch-{time.strftime("%Y%m%d-%H%M%S")}', help='output directory')
+    r.add_argument('-i', '--interval', type=float, default=0.25, help='seconds between samples (default 0.25)')
+    r.add_argument('-d', '--duration', type=float, default=0, help='stop after N seconds (0 = until exit)')
+    r.add_argument('--wait', type=float, default=0, help='give up finding a target after N seconds (0 = forever)')
+    s = sub.add_parser('summary', help='summarize a recording')
+    s.add_argument('dir', help='directory written by record')
+    s.add_argument('--window', help='window.json to restrict to (default: DIR/../window.json if present)')
+    s.add_argument('--no-window', action='store_true', help='ignore window.json, summarize everything')
+    s.add_argument('--from', dest='t_from', type=float, help='seconds since record start')
+    s.add_argument('--to', dest='t_to', type=float, help='seconds since record start')
+    s.add_argument('--fps', type=float, help='frame rate for per-frame figures (default: window.json avg_fps)')
+    s.add_argument('--top', type=int, default=15, help='threads to list (default 15)')
+    s.add_argument('--markdown', action='store_true', help='Markdown tables (for GitHub)')
+    a = ap.parse_args()
+    if a.cmd == 'record' and not (a.pid or a.name or a.root):
+        ap.error('record needs --pid, --name or --root')
+    return cmd_record(a) if a.cmd == 'record' else cmd_summary(a)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
