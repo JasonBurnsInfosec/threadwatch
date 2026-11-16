@@ -10,6 +10,11 @@ Part of a small toolkit for investigating Linux gaming performance:
 [gamerun](https://github.com/JasonBurnsInfosec/gamerun) (run and record) ·
 [benchsum](https://github.com/JasonBurnsInfosec/benchsum) (frame-time statistics) · **threadwatch** (per-thread CPU and wait profiling)
 
+![threadwatch top following Total War: ROME II under Proton](docs/top-rome2.png)
+
+*`threadwatch top` on Total War: ROME II under Proton: the main thread is pinned to CPUs 0-1, and
+MangoHud's thread inherited that mask (`hot-mask`), so it competes with the main thread for those two CPUs.*
+
 ## Why
 
 An FPS number tells you *that* something is slow, not *why*. In CPU-bound games the answer is usually
@@ -69,7 +74,8 @@ launch and limits the summary to the benchmark window.
 threadwatch top --name 'Rome2\.exe' --also wineserver --syscalls 1000
 ```
 
-A terminal dashboard of the same data `record` collects, refreshed every second (`-i` to change):
+A terminal dashboard of the same data `record` collects (screenshot at the top), refreshed every second
+(`-i` to change):
 
 - **Header**: the target's threads and cores busy (1.00 = one full core) with a history sparkline, the
   hottest thread and its allowed-CPU mask, and every logical CPU grouped by L3 cache with system-wide
