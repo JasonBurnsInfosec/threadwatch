@@ -32,6 +32,7 @@ to wineserver round trips, which led to the cause of an ntsync vs fsync gap
 - Summaries restricted to a benchmark window, with **per-frame** CPU time and context switches
 - Heuristic hints: hot threads sharing a core, threads inheriting a pinned thread's mask, spin loops,
   wineserver waits
+- Text, Markdown or JSON output; works for any process (emulators, encoders, servers), not only games
 - Python 3.8+, standard library only, a single file; works on your own processes without root
 
 ## Install
@@ -48,6 +49,10 @@ ln -s ~/src/threadwatch/threadwatch ~/.local/bin/threadwatch
 threadwatch record --name 'Rome2\.exe' --also wineserver --syscalls 1000 -o rome2-run1
 threadwatch summary rome2-run1 --fps 53.8            # --fps adds per-frame columns
 threadwatch summary rome2-run1 --from 60 --to 172    # only part of the recording
+threadwatch summary rome2-run1 --json > rome2.json   # the same as JSON, for scripts and dashboards
+
+# any process, not just games: an emulator, an encoder, a build
+threadwatch record --name '^ffmpeg$' -d 60 -o ffmpeg-sample && threadwatch summary ffmpeg-sample
 ```
 
 [gamerun](https://github.com/JasonBurnsInfosec/gamerun) runs threadwatch automatically for every
@@ -96,6 +101,22 @@ thread of each `--also` process. Wine/Proton details handled for you:
 - **ntsync** ioctls are decoded (`ioctl ntsync WAIT_ANY`, `EVENT_SET`, …).
 - File descriptors of read/write calls are resolved. In a Wine process, `readv pipe` is usually the
   thread waiting for a **wineserver** reply; `ioctl /dev/dri/…` or `/dev/nvidiactl` is the GPU driver.
+
+## Summary options
+
+```
+threadwatch summary DIR [--window FILE | --from S --to S | --no-window] [--fps N] [--top N] [--markdown | --json]
+```
+
+| option | |
+|---|---|
+| `--window FILE` | restrict to a `window.json` (benchsum `--write-window` / gamerun). Default: `DIR/../window.json` if it exists |
+| `--no-window` | summarize the whole recording |
+| `--from S`, `--to S` | seconds since the recording started |
+| `--fps N` | frame rate for the per-frame columns (default: the window's avg FPS) |
+| `--top N` | threads to list (default 15) |
+| `--markdown` | tables for GitHub |
+| `--json` | everything as JSON: threads, `--also` processes, blocked-in profiles, hot-thread placement, masks, per-core busy, hints |
 
 ## Reading the summary
 
