@@ -53,16 +53,17 @@ ln -s ~/src/threadwatch/threadwatch ~/.local/bin/threadwatch
 ## Quick start
 
 ```sh
-# watch a running game live (q quits, ? explains every column)
-threadwatch top --name 'Rome2\.exe' --also wineserver
+# watch the running Steam game live (q quits, ? explains every column)
+threadwatch top
 
-# start before or after the game; follows it until it exits
-threadwatch record --name 'Rome2\.exe' --also wineserver --syscalls 1000 -o rome2-run1
+# record it: start before or after the game; follows it until it exits
+threadwatch record --syscalls 1000 -o rome2-run1
 threadwatch summary rome2-run1 --fps 53.8            # --fps adds per-frame columns
 threadwatch summary rome2-run1 --from 60 --to 172    # only part of the recording
 threadwatch summary rome2-run1 --json > rome2.json   # the same as JSON, for scripts and dashboards
 
-# any process, not just games: an emulator, an encoder, a build
+# any other process: pick it by name or pid (a non-Steam game, an emulator, an encoder, a build)
+threadwatch top --name 'Game\.exe'
 threadwatch record --name '^ffmpeg$' -d 60 -o ffmpeg-sample && threadwatch summary ffmpeg-sample
 ```
 
@@ -72,13 +73,15 @@ launch and limits the summary to the benchmark window.
 ## Live view
 
 ```sh
-threadwatch top --name 'Rome2\.exe' --also wineserver --syscalls 1000
+threadwatch top                          # the running Steam game (waits for one to start)
+threadwatch top --syscalls 1000          # also show what the selected thread is blocked in
+threadwatch top --pid 12345              # any process; or --name REGEX
 ```
 
 A terminal dashboard of the same data `record` collects (screenshot at the top), refreshed every second
 (`-i` to change):
 
-- **Header**: the target's threads and cores busy (1.00 = one full core) with a history sparkline (scaled from 0 to the peak, rounded up to whole cores), the
+- **Header**: the game's name and Steam app ID in the title, the target's threads and cores busy (1.00 = one full core) with a history sparkline (scaled from 0 to the peak, rounded up to whole cores), the
   hottest thread and its allowed-CPU mask, and every logical CPU grouped by L3 cache with system-wide
   busy%. CPUs the hottest thread may run on are highlighted, the one it is on now is underlined, and
   `*` marks the firmware's preferred (CPPC) cores.
@@ -89,23 +92,40 @@ A terminal dashboard of the same data `record` collects (screenshot at the top),
   `--syscalls` what it is blocked in over the last 5 s (futex, ntsync waits, wineserver pipe reads...).
 
 Keys: `↑↓`/`j k` select, `s` sort, `a` all/active threads, `p` pause, `+ -` interval, `?` explains every
-column, `q` quits. With `--name` it waits for the process and picks up the next one when it exits.
+column, `q` quits. It waits for the game (or the `--name` match) and picks up the next one when it exits.
+If the game starts from a launcher, it moves to the game once that is clearly busier.
 It records nothing; use `record` when you need numbers you can quote. Standard library `curses`, no extra
 dependencies.
+
+## Choosing the process
+
+By default `top` and `record` find the running **Steam game** on their own. Steam puts `SteamAppId` in the
+environment of everything it starts for a game; threadwatch takes those processes, drops Wine/Proton
+helpers (wineserver, `services.exe`, the Proton script, pressure-vessel, the overlay...) and picks the
+busiest `.exe`, or for a native game the busiest process. The game's name comes from Steam's app manifest,
+and the game's own wineserver is shown next to it (not every wineserver on the system). Nothing to
+configure, and it works whether you start threadwatch before or after the game.
+
+Pick a process yourself when that isn't what you want: `--appid N` for one of several running games,
+`--pid` or `--name` for anything else (non-Steam games, Lutris/Heroic, emulators, any program), `--root`
+for descendants of a launcher. Reading another process's environment needs the same user, as with the
+rest of `/proc`.
 
 ## Recording
 
 ```
-threadwatch record (--pid PID | --name REGEX | --root PID [--name REGEX]) [--also REGEX]...
+threadwatch record [--appid N | --pid PID | --name REGEX | --root PID [--name REGEX]] [--also REGEX]...
                    [--syscalls HZ] [-o DIR] [-i SECS] [-d SECS] [--wait SECS]
 ```
 
 | option | |
 |---|---|
+| (none) | the running Steam game; waits for one to start (see above) |
+| `--appid N` | the Steam game with app ID N, when several are running |
 | `--pid PID` | follow this process |
 | `--name REGEX` | wait for a process whose name or argv0 basename matches (case-insensitive). Wine puts the `.exe` name in argv0, so `'Game\.exe'` works |
 | `--root PID` | only consider descendants of PID (e.g. a launch wrapper). Without `--name`, picks the busiest `.exe` (≥0.5 core), or after 20 s the busiest process (≥0.2 core) |
-| `--also REGEX` | also record every process matching REGEX, system-wide (repeatable), e.g. `wineserver` |
+| `--also REGEX` | also record every process matching REGEX, system-wide (repeatable). Without it, a Steam game's own wineserver is recorded automatically |
 | `--syscalls HZ` | sample what threads are blocked in, HZ times per second (500–1000 is plenty) |
 | `-o DIR` | output directory (default `threadwatch-<timestamp>`) |
 | `-i SECS` | sampling interval, default 0.25 |
@@ -119,7 +139,7 @@ Output files:
 | `threads.csv` | t, tid, thread name, state, last CPU, CPU%, voluntary and involuntary switches per second, allowed-CPU list, process (`target` or the `--also` name), pid |
 | `cores.csv` | busy% per logical CPU (system-wide) |
 | `syscalls.csv` | with `--syscalls`: per second and thread, how many samples were running or in each syscall |
-| `meta.json` | target, settings, `--also` processes seen, CPU topology |
+| `meta.json` | target, Steam app ID and game name, settings, extra processes seen, CPU topology |
 
 ### How syscall sampling works
 
@@ -203,7 +223,11 @@ Patterns to look for:
 - `top` needs a terminal of at least 60x16; 100+ columns shows the full per-core bars.
 - Thread names come from the kernel's `comm` (Wine fills it from `SetThreadDescription`); unnamed
   threads show as `(unnamed)`.
-- `--also` matches system-wide: with several Wine prefixes running, it records every wineserver.
+- `--also` matches system-wide: with several Wine prefixes running, it records every wineserver (the
+  default Steam mode picks only the game's own).
+- The default mode finds games that Steam launched (it relies on `SteamAppId`); for games started any
+  other way use `--pid` or `--name`. A launcher that stays busier than the game keeps being shown; pick
+  the game with `--name` then.
 - Linux only (`/proc`, `/sys` topology).
 
 ## Related

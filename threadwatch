@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """threadwatch - per-thread CPU sampler for diagnosing CPU-bound games (Proton/Wine or native).
 
-  threadwatch record  (--pid PID | --name REGEX | --root PID [--name REGEX]) [--also REGEX]...
-                      [--syscalls HZ] [-o DIR] [-i SECS] [-d SECS]
+  threadwatch record  [--appid N | --pid PID | --name REGEX | --root PID [--name REGEX]]
+                      [--also REGEX]... [--syscalls HZ] [-o DIR] [-i SECS] [-d SECS]
   threadwatch summary DIR [--window FILE | --from S --to S] [--fps N] [--top N] [--markdown | --json]
-  threadwatch top     (--pid PID | --name REGEX | --root PID [--name REGEX]) [--also REGEX]...
-                      [--syscalls HZ] [-i SECS]
+  threadwatch top     [--appid N | --pid PID | --name REGEX | --root PID [--name REGEX]]
+                      [--also REGEX]... [--syscalls HZ] [-i SECS]
 
 record samples every thread of the target process from /proc: CPU%, state, last core,
 allowed cores and voluntary/involuntary context switches, plus per-core busy% and the
@@ -13,12 +13,18 @@ CPU cache/SMT topology. Output: DIR/threads.csv, DIR/cores.csv, DIR/meta.json
 (and DIR/syscalls.csv with --syscalls).
 
 Target selection:
+  (default)            the running Steam game: processes with SteamAppId in their environment,
+                       minus Wine/Proton helpers; the busiest .exe, else (native games) the busiest
+                       process. Waits for one to start. top also moves from a launcher to the game
+                       when another process of the same game becomes clearly busier.
+  --appid N            default mode, but only Steam app N (when several games are running)
   --pid PID            follow that process
   --name REGEX         wait for a process whose name/argv0 matches (case-insensitive)
   --root PID           only consider descendants of PID (e.g. a launch wrapper); without
                        --name, auto-pick the busiest descendant, preferring *.exe
-  --also REGEX         also record every process whose name matches (e.g. wineserver);
-                       repeatable; looked up system-wide every 2 s
+  --also REGEX         also record every process whose name matches; repeatable; looked up
+                       system-wide every 2 s. Without --also, a Steam game's own wineserver
+                       (same SteamAppId) is added automatically.
   --syscalls HZ        sample what threads are blocked in (/proc/<pid>/task/<tid>/syscall) at
                        HZ: the target's main thread, its 2 busiest threads and the main thread of
                        each --also process. i386 and x86_64 syscall tables (32-bit Wine processes
@@ -61,7 +67,7 @@ def parse_stat(text):
 
 
 def proc_table():
-    """pid -> (ppid, comm, cputicks) for all processes."""
+    """pid -> (ppid, comm, cputicks, starttime) for all processes."""
     out = {}
     for d in os.listdir('/proc'):
         if not d.isdigit():
@@ -71,7 +77,7 @@ def proc_table():
             continue
         try:
             comm, f = parse_stat(t)
-            out[int(d)] = (int(f[1]), comm, int(f[11]) + int(f[12]))
+            out[int(d)] = (int(f[1]), comm, int(f[11]) + int(f[12]), int(f[19]))
         except (ValueError, IndexError):
             pass
     return out
@@ -79,7 +85,7 @@ def proc_table():
 
 def descendants(root, table):
     kids = defaultdict(list)
-    for pid, (ppid, _, _) in table.items():
+    for pid, (ppid, *_) in table.items():
         kids[ppid].append(pid)
     out, todo = set(), [root]
     while todo:
@@ -103,6 +109,8 @@ def proc_names(pid, comm):
 
 def find_target(args):
     """Block until a target process is found; return pid or None on stop/timeout."""
+    if is_auto(args):
+        return find_steam_game(args)
     pat = re.compile(args.name, re.I) if args.name else None
     deadline = time.time() + args.wait if args.wait else None
     started = time.time()
@@ -146,11 +154,158 @@ def find_also(patterns, exclude):
     table = proc_table()
     for pat in patterns:
         rx = re.compile(pat, re.I)
-        for pid, (_, comm, _) in table.items():
+        for pid, (_, comm, *_) in table.items():
             if pid in exclude or pid == os.getpid():
                 continue
             if any(rx.search(n) for n in proc_names(pid, comm)):
                 out.append((comm, pid))
+    return out
+
+
+# ---------------------------------------------------------------- Steam game detection
+# Steam puts SteamAppId in the environment of everything it launches for a game. These processes carry it
+# too but are never the game itself: Wine/Proton helpers, the container and launch wrappers, the overlay.
+NOT_GAME = {
+    'wineserver', 'wine', 'wine64', 'wine-preloader', 'wine64-preloader', 'winedbg', 'services.exe', 'winedevice.exe',
+    'plugplay.exe', 'explorer.exe', 'rpcss.exe', 'svchost.exe', 'conhost.exe', 'start.exe', 'steam.exe', 'tabtip.exe',
+    'rundll32.exe', 'wineboot.exe', 'winemenubuilder.exe', 'xalia.exe', 'mscorsvw.exe', 'iexplore.exe', 'cmd.exe',
+    'crashpad_handler', 'reaper', 'pv-adverb', 'pressure-vessel-wrap', 'pressure-vessel-adverb', 'srt-bwrap', 'bwrap',
+    'steam-runtime-launcher-service', 'steam-launch-wrapper', 'gameoverlayui', 'python3', 'python', 'sh', 'bash',
+    'dash', 'env', 'timeout', 'gamemoderun', 'mangohud', 'gamescope', 'threadwatch', 'gamerun', 'tee', 'sleep',
+}
+STEAM_ROOTS = ('~/.local/share/Steam', '~/.steam/steam', '~/.steam/root',
+               '~/.var/app/com.valvesoftware.Steam/.local/share/Steam')
+_appid_cache = {}  # pid -> ((starttime, comm), appid or None); comm changes on exec, starttime does not
+_name_cache = {}
+
+
+def is_auto(args):
+    return not (args.pid or args.name or args.root)
+
+
+def steam_appid(pid, starttime=None, comm=None):
+    """The SteamAppId in pid's environment (None if not a Steam launch or not readable). Cached per process
+    image: keyed on start time and comm, because exec keeps the pid and start time but changes comm."""
+    if starttime is None or comm is None:
+        st = read(f'/proc/{pid}/stat')
+        try:
+            comm, f = parse_stat(st)
+            starttime = int(f[19])
+        except (TypeError, ValueError, IndexError):
+            return None
+    key = (starttime, comm)
+    hit = _appid_cache.get(pid)
+    if hit and hit[0] == key:
+        return hit[1]
+    appid = None
+    env = read(f'/proc/{pid}/environ')
+    if env:
+        for var in env.split('\0'):
+            if var.startswith(('SteamAppId=', 'SteamGameId=')):
+                v = var.split('=', 1)[1]
+                if v.isdigit() and v != '0':
+                    appid = v
+                    break
+    if len(_appid_cache) > 4096:
+        _appid_cache.clear()
+    _appid_cache[pid] = (key, appid)
+    return appid
+
+
+def steam_game_name(appid):
+    """Game name from Steam's appmanifest, or None."""
+    if not appid:
+        return None
+    if appid in _name_cache:
+        return _name_cache[appid]
+    libs = []
+    for root in STEAM_ROOTS:
+        root = os.path.expanduser(root)
+        libs.append(root)
+        vdf = read(os.path.join(root, 'steamapps', 'libraryfolders.vdf')) or ''
+        libs += [p.replace('\\\\', '\\') for p in re.findall(r'"path"\s+"([^"]+)"', vdf)]
+    name = None
+    for lib in dict.fromkeys(libs):
+        acf = read(os.path.join(lib, 'steamapps', f'appmanifest_{appid}.acf'))
+        m = re.search(r'"name"\s+"([^"]+)"', acf or '')
+        if m:
+            name = m.group(1)
+            break
+    _name_cache[appid] = name
+    return name
+
+
+def game_label(pid):
+    """'Game Name (appid)' for a Steam-launched pid, else None."""
+    appid = steam_appid(pid)
+    if not appid:
+        return None
+    return f'{steam_game_name(appid) or "Steam app"} ({appid})'
+
+
+def steam_candidates(table, appid_filter=None):
+    """[(pid, appid, is_exe)] for processes Steam launched for a game, minus helpers."""
+    out = []
+    for pid, (_, comm, _, start) in table.items():
+        if pid == os.getpid():
+            continue
+        appid = steam_appid(pid, start, comm)
+        if not appid or (appid_filter and appid != str(appid_filter)):
+            continue
+        names = [n.lower() for n in proc_names(pid, comm)]
+        if any(n in NOT_GAME for n in names):
+            continue
+        out.append((pid, appid, any(n.endswith('.exe') for n in names)))
+    return out
+
+
+def pick_busiest(cands, table, prev, waited):
+    """Choose the game process: the busiest .exe (Proton), else after a few seconds the busiest process (native)."""
+    best_exe = best_any = (-1, 0)  # (cpu ticks, pid); pid 0 = none
+    for pid, appid, is_exe in cands:
+        ticks = table[pid][2]
+        delta = ticks - prev.get(pid, ticks)
+        if is_exe:
+            best_exe = max(best_exe, (delta, pid))
+        best_any = max(best_any, (delta, pid))
+    if best_exe[1] and best_exe[0] >= 0.2 * CLK_TCK:
+        return best_exe[1]
+    if waited >= 3 and best_any[1] and best_any[0] >= 0.2 * CLK_TCK:
+        return best_any[1]
+    return None
+
+
+def find_steam_game(args):
+    """Block until a Steam game is running and busy; return its game process pid (None on stop/timeout)."""
+    deadline = time.time() + args.wait if args.wait else None
+    prev, first_seen = {}, None
+    while not _stop and (deadline is None or time.time() < deadline):
+        table = proc_table()
+        cands = steam_candidates(table, getattr(args, 'appid', None))
+        if cands:
+            first_seen = first_seen or time.time()
+            pid = pick_busiest(cands, table, prev, time.time() - first_seen)
+            if pid:
+                return pid
+        else:
+            first_seen = None
+        prev = {p: table[p][2] for p, _, _ in cands}
+        time.sleep(1.0)
+    return None
+
+
+def companions(args, pid):
+    """[(label, pid)] of extra processes to show next to the target: --also matches, or by default for a
+    Steam game the wineserver(s) of the same game (not every wineserver on the system)."""
+    if args.also:
+        return find_also(args.also, {pid})
+    appid = steam_appid(pid)
+    if not appid:
+        return []
+    out = []
+    for p, (_, comm, _, start) in proc_table().items():
+        if p != pid and comm == 'wineserver' and steam_appid(p, start, comm) == appid:
+            out.append((comm, p))
     return out
 
 
@@ -329,6 +484,8 @@ class SyscallSampler(threading.Thread):
 def cmd_record(args):
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
+    if is_auto(args):
+        print('threadwatch: waiting for a Steam game (use --pid or --name for other processes)', file=sys.stderr)
     pid = args.pid or find_target(args)
     if not pid:
         print('threadwatch: no target found', file=sys.stderr)
@@ -345,8 +502,10 @@ def cmd_record(args):
         'interval_s': args.interval, 'clk_tck': CLK_TCK, 'ncpu': NCPU,
         'start_epoch': time.time(), 'topology': topology(), 'also': args.also or [],
         'syscall_hz': args.syscalls or 0, 'also_seen': {},
+        'steam_appid': steam_appid(pid), 'game': steam_game_name(steam_appid(pid)),
     }
-    print(f'threadwatch: following pid {pid} ({comm}) -> {args.out}', file=sys.stderr)
+    game = f" - {game_label(pid)}" if steam_appid(pid) else ''
+    print(f'threadwatch: following pid {pid} ({comm}){game} -> {args.out}', file=sys.stderr)
 
     tf = open(os.path.join(args.out, 'threads.csv'), 'w', newline='')
     cf = open(os.path.join(args.out, 'cores.csv'), 'w', newline='')
@@ -361,7 +520,7 @@ def cmd_record(args):
         sampler.set_targets([('target', pid, pid, 'main')])
         sampler.start()
     procs = {pid: 'target'}  # pid -> label
-    for label, p in find_also(args.also, {pid}):
+    for label, p in companions(args, pid):
         procs[p] = label
         meta['also_seen'][str(p)] = label
     prev_t = t0
@@ -371,9 +530,9 @@ def cmd_record(args):
     while not _stop:
         time.sleep(args.interval)
         now = time.monotonic()
-        if args.also and now - last_also >= 2.0:
+        if now - last_also >= 2.0:
             last_also = now
-            for label, p in find_also(args.also, {pid}):
+            for label, p in companions(args, pid):
                 if p not in procs:
                     procs[p] = label
                     meta['also_seen'][str(p)] = label
@@ -527,7 +686,8 @@ def cmd_summary(args):
     hdr = ['tid', 'thread', 'avg CPU%', 'peak%', 'running%', 'cores used', 'migr/s', 'vol cs/s', 'invol cs/s', 'allowed']
     if fps:
         hdr += ['CPU ms/frame', 'vol cs/frame']
-    out = [f"**{meta['comm']}** (pid {target_pid}): window {wdesc}, {dur:.0f} s, {nt} samples @ {meta['interval_s']} s, "
+    game = f"{meta['game'] or 'Steam app'} ({meta['steam_appid']}), " if meta.get('steam_appid') else ''
+    out = [f"{game}**{meta['comm']}** (pid {target_pid}): window {wdesc}, {dur:.0f} s, {nt} samples @ {meta['interval_s']} s, "
            f"{len(target)} threads seen, avg {total_cores:.2f} cores busy of {meta['ncpu']}"
            + (f", per-frame figures at {fps:.2f} FPS" if fps else ''), '']
     rows = sorted(target.items(), key=lambda kv: -kv[1]['cpu'])[:args.top]
@@ -543,7 +703,7 @@ def cmd_summary(args):
             d['cpu_ms_per_frame'] = round(p['cpu'] / n / 100 / fps * 1000, 3)
             d['vol_cs_per_frame'] = round(p['vcs'] / n / fps, 2)
         return d
-    report = {'process': meta['comm'], 'pid': target_pid, 'window': wdesc, 'window_s': [t_from, None if t_to == float('inf') else t_to],
+    report = {'process': meta['comm'], 'pid': target_pid, 'steam_appid': meta.get('steam_appid'), 'game': meta.get('game'), 'window': wdesc, 'window_s': [t_from, None if t_to == float('inf') else t_to],
               'duration_s': dur, 'samples': nt, 'fps': fps, 'cores_busy': round(total_cores, 3), 'ncpu': meta['ncpu'],
               'threads': [thread_dict(tid, p) for (_, tid), p in rows], 'also': {}, 'blocked': {}}
 
@@ -743,7 +903,7 @@ class LiveModel:
         self.reset(None)
 
     def reset(self, pid):
-        self.pid, self.comm = pid, ''
+        self.pid, self.comm, self.game = pid, '', None
         self.procs = {}
         self.prev_th, self.prev_c, self.prev_t = {}, cpu_times(), time.monotonic()
         self.hist = defaultdict(lambda: deque(maxlen=self.HIST))  # (pid, tid) -> (pct, cpu, vcs, nvcs)
@@ -754,6 +914,7 @@ class LiveModel:
         if pid:
             st = read(f'/proc/{pid}/stat')
             self.comm = parse_stat(st)[0] if st else '?'
+            self.game = game_label(pid)
             self.procs = {pid: 'target'}
             self.prev_th = {pid: thread_sample(pid) or {}}
 
@@ -764,9 +925,9 @@ class LiveModel:
         now = time.monotonic()
         if now - self.prev_t < 0.5 * self.interval:
             return  # just (re)started: a tiny dt turns one clock tick into thousands of percent
-        if self.args.also and now - self.last_also >= 2.0:
+        if now - self.last_also >= 2.0:
             self.last_also = now
-            for label, p in find_also(self.args.also, {self.pid}):
+            for label, p in companions(self.args, self.pid):
                 if p not in self.procs:
                     self.procs[p] = label
                     self.prev_th[p] = thread_sample(p) or {}
@@ -831,7 +992,9 @@ class TopUI:
         self.model = LiveModel(args)
         self.sort, self.show_all, self.paused, self.help = 'cpu', False, False, False
         self.sel_key, self.offset = None, 0
+        self.xmax = None  # right clip for put(), used while drawing a row with a right-aligned tail
         self.finder, self.found, self.status = None, None, ''
+        self.notice, self.sw_prev, self.sw_next = None, None, 0.0
         self.sys = None
         if args.syscalls:
             self.sys = LiveSyscalls(args.syscalls)
@@ -883,7 +1046,8 @@ class TopUI:
         if y < 0 or y >= h or x >= w:
             return x
         s = str(s)
-        room = min(w - x, width if width is not None else w - x)
+        right = min(w, self.xmax) if self.xmax else w
+        room = min(right - x, width if width is not None else right - x)
         s = s[:max(0, room)]
         try:
             self.scr.addstr(y, x, s, attr)
@@ -911,7 +1075,12 @@ class TopUI:
             self.found = args.pid
             return
         def run():
-            self.found = find_target(args)
+            try:
+                self.found = find_target(args)
+            except Exception as e:  # never let a traceback scribble over the screen
+                self.status = f'target search failed: {type(e).__name__}: {e}'
+                self.found = -1
+                return
             if self.found is None and not _stop:
                 self.found = -1
         self.found = None
@@ -925,7 +1094,7 @@ class TopUI:
         if m.pid and m.exited:
             if self.args.pid or self.found == -1:
                 return  # nothing to wait for: keep the last frame
-            self.status = f'{m.comm} ({m.pid}) exited; waiting for the next match'
+            self.status = f'{m.comm} ({m.pid}) exited; ' + ('waiting for the next game' if is_auto(self.args) else 'waiting for the next match')
             m.reset(None)
             self.start_finder()
         if self.found and self.found > 0 and not m.pid:
@@ -966,32 +1135,45 @@ class TopUI:
         cell = 10 if w >= 20 + 8 * 10 else 4  # "NN ▕bar▏" or "NN▆"
         lines = 3 + len(m.l3)
         self.box(y, 0, lines + 2, w, 'threadwatch')
+        if m.pid and m.game:
+            self.put(y, 15, f' {m.game} '[:max(0, w - 18)], A['orange'])
         x = 2
         r1 = y + 1
         if not m.pid:
-            self.put(r1, x, self.status or f"waiting for a process matching {self.args.name or 'the busiest descendant'}...",
-                     A['yellow'])
+            if is_auto(self.args):
+                want = f'Steam app {self.args.appid}' if self.args.appid else 'a Steam game'
+                wait = f'waiting for {want} to start (or run with --pid / --name for any process)...'
+            else:
+                wait = f"waiting for a process matching {self.args.name or 'the busiest descendant'}..."
+            self.put(r1, x, self.status or wait, A['yellow'])
+            if self.status:
+                self.put(r1 + 1, x, wait, A['dim'])
             return y + lines + 2
         busy = m.total_hist[-1] if m.total_hist else 0.0
+        el = int(time.monotonic() - m.started)
+        tail = ('PAUSED  ' if self.paused else '') + f'{self.model.interval:g}s  {el // 60}:{el % 60:02d}'
+        self.put(r1, w - 2 - len(tail), tail, A['orange'] if self.paused else A['dim'])
+        self.xmax = w - 4 - len(tail)  # row 1 content stops before the tail
         x = self.put(r1, x, m.comm, A['title'])
         x = self.put(r1, x, f'  pid {m.pid}', A['dim'])
         nthreads = sum(1 for r in m.rows if r['proc'] == 'target')
         x = self.put(r1, x, f'  {nthreads} threads  ')
         x = self.put(r1, x, f'{busy:.2f}', A['title'])
         x = self.put(r1, x, f' of {NCPU} cores busy  ')
-        hist = list(m.total_hist)[-max(10, min(60, w - x - 30)):]
         # Fixed scale: 0 to the peak over the whole history, rounded up to whole cores. Scaling to the visible
         # max drew a steady load (e.g. 1.42 cores) as a solid full-height bar.
         peak = max(m.total_hist, default=0.0)
         scale = max(1, int(-(-peak // 1)))
+        peak_s = f'  peak {peak:.2f}  (0-{scale} cores)'
+        also = sorted(m.also_cores.items())
+        room = self.xmax - x - len(peak_s) - sum(len(f'  {label} 0.00') for label, _ in also)
+        hist = list(m.total_hist)[-max(4, min(60, room)):]
         x = self.put(r1, x, spark(hist, scale), A['green'])
-        x = self.put(r1, x, f'  peak {peak:.2f}  (0-{scale} cores)', A['dim'])
-        for label, cores in sorted(m.also_cores.items()):
+        x = self.put(r1, x, peak_s, A['dim'])
+        for label, cores in also:
             x = self.put(r1, x, f'  {label} ', A['dim'])
             x = self.put(r1, x, f'{cores:.2f}', A['magenta'])
-        el = int(time.monotonic() - m.started)
-        tail = ('PAUSED  ' if self.paused else '') + f'{self.model.interval:g}s  {el // 60}:{el % 60:02d}'
-        self.put(r1, w - 2 - len(tail), tail, A['orange'] if self.paused else A['dim'])
+        self.xmax = None
         r2 = y + 2
         if hot:
             x = self.put(r2, 2, 'hottest ', A['dim'])
@@ -1032,7 +1214,7 @@ class TopUI:
 
     def draw_table(self, y, h, w, rows):
         m, A = self.model, self.A
-        cols = [c for c in self.COLS if c[0] != 'Proc' or self.args.also]
+        cols = [c for c in self.COLS if c[0] != 'Proc' or any(r['proc'] != 'target' for r in m.rows)]
         hot = m.hottest()
         x = 0
         self.put(y, 0, ' ' * w, A['hdr'])
@@ -1171,11 +1353,14 @@ class TopUI:
             x = self.put(y, x, k, A['key'])
             x = self.put(y, x, f' {label}  ', A['hdr'])
         hidden = len(self.model.rows) - len(self.visible_rows())
-        if hidden > 0:
-            msg = f'{hidden} idle threads hidden '
-            self.put(y, w - len(msg) - 1, msg, A['hdr'])
+        msg = f'{hidden} idle threads hidden ' if hidden > 0 else ''
+        if self.notice and time.monotonic() < self.notice[1]:
+            msg = f'{self.notice[0]}   {msg}'
+        if msg:
+            self.put(y, max(x, w - len(msg) - 1), msg, A['hdr'])
 
     HELP = [
+        ('Title', 'the Steam game and app ID (default mode follows the running game, launcher -> game).'),
         ('Header', 'target process, threads, cores busy (1.00 = one full core); the history graph runs from 0 to'),
         ('', 'the peak rounded up to whole cores, labelled e.g. (0-2 cores).'),
         ('hottest', 'the target thread with the highest 10 s average CPU, its current CPU and allowed-CPU mask.'),
@@ -1259,6 +1444,30 @@ class TopUI:
             self.help = True
         return True
 
+    def maybe_switch(self):
+        """Default (Steam) mode: move to another process of the same game when it is clearly busier,
+        e.g. from a launcher to the game it started. Checked every 5 s."""
+        m, now = self.model, time.monotonic()
+        if not is_auto(self.args) or not m.pid or m.exited or now < self.sw_next:
+            return
+        self.sw_next = now + 5.0
+        table = proc_table()
+        appid = self.args.appid or steam_appid(m.pid)
+        ticks = {p: table[p][2] for p, _, _ in steam_candidates(table, appid)}
+        if m.pid in table:
+            ticks[m.pid] = table[m.pid][2]
+        prev, self.sw_prev = self.sw_prev, (now, ticks)
+        if not prev:
+            return
+        dt = now - prev[0]
+        delta = {p: t - prev[1].get(p, t) for p, t in ticks.items()}
+        best = max((p for p in delta if p != m.pid), key=lambda p: delta[p], default=None)
+        if best and delta[best] > max(2 * delta.get(m.pid, 0), 0.5 * CLK_TCK * dt):
+            old = m.comm
+            m.reset(best)
+            self.sel_key, self.offset, self.sw_prev = None, 0, None
+            self.notice = (f'switched from {old} to busier {m.comm}', now + 15)
+
     def update_syscall_targets(self):
         if not self.sys or not self.model.pid:
             return
@@ -1276,6 +1485,7 @@ class TopUI:
         next_sample = 0.0
         while not _stop:
             self.poll_target()
+            self.maybe_switch()
             now = time.monotonic()
             if self.model.pid and not self.model.exited and not self.paused and now >= next_sample:
                 self.model.sample()
@@ -1316,11 +1526,12 @@ def main():
                                  epilog='Run `threadwatch <command> -h` for options. '
                                         'Docs: https://github.com/JasonBurnsInfosec/threadwatch')
     sub = ap.add_subparsers(dest='cmd', required=True)
-    r = sub.add_parser('record', help='sample a process')
+    r = sub.add_parser('record', help='sample a process (default: the running Steam game)')
     g = r.add_mutually_exclusive_group()
     g.add_argument('--pid', type=int, help='follow this process')
     r.add_argument('--name', help='regex on process name / argv0 basename')
     r.add_argument('--root', type=int, help='restrict search to descendants of this pid')
+    r.add_argument('--appid', type=int, help='default mode: only this Steam game (when several are running)')
     r.add_argument('--also', action='append', metavar='REGEX', help='also record processes matching REGEX (repeatable)')
     r.add_argument('--syscalls', type=float, metavar='HZ', default=0, help='sample blocked-in syscalls at HZ (e.g. 1000)')
     r.add_argument('-o', '--out', default=f'threadwatch-{time.strftime("%Y%m%d-%H%M%S")}', help='output directory')
@@ -1338,9 +1549,10 @@ def main():
     s.add_argument('--markdown', action='store_true', help='Markdown tables (for GitHub)')
     s.add_argument('--json', action='store_true', help='machine-readable summary')
     t = sub.add_parser(
-        'top', help='live per-thread view in the terminal', formatter_class=argparse.RawDescriptionHelpFormatter,
-        description='Live terminal view: per-core load grouped by L3 cache, a sortable thread table and an '
-                    'inspector for the selected thread. Records nothing; use `record` for numbers you can quote.',
+        'top', help='live per-thread view in the terminal (default: the running Steam game)', formatter_class=argparse.RawDescriptionHelpFormatter,
+        description='Live terminal view: per-core load grouped by L3 cache, a sortable thread table and an\n'
+                    'inspector for the selected thread. Without --pid/--name/--root it follows the running\n'
+                    'Steam game. Records nothing; use `record` for numbers you can quote.',
         epilog="""keys:
   up/down, j/k, PgUp/PgDn, Home/End   select a thread
   s     cycle sort: cpu, peak, vol, invol, tid, name
@@ -1351,19 +1563,22 @@ def main():
   q     quit (Esc works too)
 
 examples:
-  threadwatch top --name 'Rome2\\.exe' --also wineserver --syscalls 1000
+  threadwatch top                          the running Steam game (waits for one)
+  threadwatch top --syscalls 1000          plus what the selected thread is blocked in
+  threadwatch top --name 'Game\\.exe'       any process by name (non-Steam games, emulators...)
   threadwatch top --pid 12345 -i 0.5""")
     t.add_argument('--pid', type=int, help='watch this process')
     t.add_argument('--name', help='regex on process name / argv0 basename (waits for it, follows restarts)')
     t.add_argument('--root', type=int, help='restrict search to descendants of this pid')
+    t.add_argument('--appid', type=int, help='default mode: only this Steam game (when several are running)')
     t.add_argument('--also', action='append', metavar='REGEX', help='also show processes matching REGEX (repeatable)')
     t.add_argument('--syscalls', type=float, metavar='HZ', default=0,
                    help='sample what the selected, main and 2 busiest threads are blocked in (e.g. 1000)')
     t.add_argument('-i', '--interval', type=float, default=1.0, help='seconds between refreshes (default 1)')
     t.add_argument('--wait', type=float, default=0, help=argparse.SUPPRESS)
     a = ap.parse_args()
-    if a.cmd in ('record', 'top') and not (a.pid or a.name or a.root):
-        ap.error(f'{a.cmd} needs --pid, --name or --root')
+    if a.cmd in ('record', 'top') and a.appid and not is_auto(a):
+        ap.error('--appid selects a Steam game in the default mode; it cannot be combined with --pid/--name/--root')
     if a.cmd == 'top':
         return cmd_top(a)
     return cmd_record(a) if a.cmd == 'record' else cmd_summary(a)
