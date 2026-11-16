@@ -980,8 +980,12 @@ class TopUI:
         x = self.put(r1, x, f'{busy:.2f}', A['title'])
         x = self.put(r1, x, f' of {NCPU} cores busy  ')
         hist = list(m.total_hist)[-max(10, min(60, w - x - 30)):]
-        x = self.put(r1, x, spark(hist, max(hist + [1.0])), A['green'])
-        x = self.put(r1, x, f'  peak {max(hist + [0.0]):.2f}', A['dim'])
+        # Fixed scale: 0 to the peak over the whole history, rounded up to whole cores. Scaling to the visible
+        # max drew a steady load (e.g. 1.42 cores) as a solid full-height bar.
+        peak = max(m.total_hist, default=0.0)
+        scale = max(1, int(-(-peak // 1)))
+        x = self.put(r1, x, spark(hist, scale), A['green'])
+        x = self.put(r1, x, f'  peak {peak:.2f}  (0-{scale} cores)', A['dim'])
         for label, cores in sorted(m.also_cores.items()):
             x = self.put(r1, x, f'  {label} ', A['dim'])
             x = self.put(r1, x, f'{cores:.2f}', A['magenta'])
@@ -1172,7 +1176,8 @@ class TopUI:
             self.put(y, w - len(msg) - 1, msg, A['hdr'])
 
     HELP = [
-        ('Header', 'target process, threads, cores busy (sum of its threads, 1.00 = one full core), history sparkline.'),
+        ('Header', 'target process, threads, cores busy (1.00 = one full core); the history graph runs from 0 to'),
+        ('', 'the peak rounded up to whole cores, labelled e.g. (0-2 cores).'),
         ('hottest', 'the target thread with the highest 10 s average CPU, its current CPU and allowed-CPU mask.'),
         ('L3 rows', 'every logical CPU grouped by shared L3 cache (CCX/CCD), with system-wide busy%.'),
         ('', "highlighted numbers: CPUs the hottest thread may run on; underlined: where it runs now."),

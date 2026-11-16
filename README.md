@@ -77,7 +77,7 @@ threadwatch top --name 'Rome2\.exe' --also wineserver --syscalls 1000
 A terminal dashboard of the same data `record` collects (screenshot at the top), refreshed every second
 (`-i` to change):
 
-- **Header**: the target's threads and cores busy (1.00 = one full core) with a history sparkline, the
+- **Header**: the target's threads and cores busy (1.00 = one full core) with a history sparkline (scaled from 0 to the peak, rounded up to whole cores), the
   hottest thread and its allowed-CPU mask, and every logical CPU grouped by L3 cache with system-wide
   busy%. CPUs the hottest thread may run on are highlighted, the one it is on now is underlined, and
   `*` marks the firmware's preferred (CPPC) cores.
