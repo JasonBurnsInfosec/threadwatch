@@ -12,9 +12,10 @@ Part of a small toolkit for investigating Linux gaming performance:
 
 ![threadwatch top following Total War: ROME II under Proton](docs/top-rome2.png)
 
-*`threadwatch top` on Total War: ROME II under Proton: the main thread runs at 100% of one core while
-only ~1.1 cores are busy overall, it is pinned to CPUs 0-1, and MangoHud's thread inherited that mask
-(`hot-mask`), so it competes with the main thread for those two CPUs.*
+*`threadwatch top`, run with no arguments, following Total War: ROME II under Proton: it found the game
+and its wineserver by itself. The game pins its main thread to CPUs 0-1 and its worker threads to 2-31;
+MangoHud's thread inherited the main thread's mask (`hot-mask`), so it competes with the main thread for
+those two CPUs.*
 
 ## Why
 
